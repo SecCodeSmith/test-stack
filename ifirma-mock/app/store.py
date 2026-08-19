@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 SCM Jakub Berechowski <admin@seccodesmith.pl>
+# See the LICENCE file in this directory for the full MIT terms.
+
 """In-memory store of documents 'issued' by the mock (reset on restart)."""
 from __future__ import annotations
 

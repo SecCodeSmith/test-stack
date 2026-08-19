@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 SCM Jakub Berechowski <admin@seccodesmith.pl>
+# See the LICENCE file in this directory for the full MIT terms.
+
 """
 Tests for the iFirma mock. The signing helper reproduces exactly what the
 PrestaShop module's IfirmaApiClient does, so these tests double as a spec of the

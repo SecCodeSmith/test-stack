@@ -119,3 +119,11 @@ so the suite is both a functional test and an executable spec of the auth contra
 - Because the module folder (repo parent) is bind-mounted, its own `test-stack/`
   appears under `modules/ifirma/test-stack` inside the container — harmless; PrestaShop
   only loads `ifirma.php`.
+
+## Legal Disclaimer & Trademarks
+
+iFirma is a registered trademark of IFIRMA SA.
+
+This module is an independent third-party open-source integration and is not officially affiliated with, endorsed by, or sponsored by IFIRMA SA.
+
+The name "iFirma" and associated references are used strictly for identification, nominative reference, and descriptive compatibility purposes (interoperability / prawo cytatu) to inform users about the third-party accounting system with which this PrestaShop module integrates.
