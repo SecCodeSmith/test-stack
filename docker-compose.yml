@@ -1,0 +1,85 @@
+name: ifirma-test-stack
+
+# Local end-to-end test stack for the PrestaShop `ifirma` module:
+#   - db            : MariaDB for PrestaShop
+#   - prestashop    : PrestaShop (latest) with the module bind-mounted live
+#   - ifirma-mock   : FastAPI mock of the iFirma API (validates the module's HMAC)
+#
+# The PrestaShop container reaches the mock over the internal network at
+# http://ifirma-mock:8001/iapi/ — set exactly that as the module's "API base URL".
+
+services:
+  db:
+    image: mariadb:11.4
+    container_name: ifirma_db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: prestashop
+      MARIADB_DATABASE: prestashop
+      MARIADB_USER: prestashop
+      MARIADB_PASSWORD: prestashop
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [ifirma]
+
+  ifirma-mock:
+    build: ./ifirma-mock
+    container_name: ifirma_mock
+    restart: unless-stopped
+    environment:
+      IFIRMA_MOCK_USER: ${IFIRMA_USER:-test@example.com}
+      IFIRMA_MOCK_KEY_FAKTURA: ${IFIRMA_KEY_FAKTURA:-1111111111111111111111111111111111111111111111111111111111111111}
+      # Must equal the module's base URL minus the trailing "/iapi/" path.
+      IFIRMA_MOCK_BASE_URL: http://ifirma-mock:8001
+      IFIRMA_MOCK_STRICT_AUTH: "true"
+    ports:
+      - "8001:8001"
+    networks: [ifirma]
+
+  prestashop:
+    image: prestashop/prestashop:latest
+    container_name: ifirma_prestashop
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      ifirma-mock:
+        condition: service_started
+    environment:
+      DB_SERVER: db
+      DB_PORT: 3306
+      DB_NAME: prestashop
+      DB_USER: prestashop
+      DB_PASSWD: prestashop
+      DB_PREFIX: ps_
+      PS_INSTALL_AUTO: 1
+      PS_ERASE_DB: 0
+      PS_DEV_MODE: 1
+      PS_DOMAIN: localhost:8080
+      PS_ENABLE_SSL: 0
+      PS_FOLDER_ADMIN: admin-dev
+      PS_FOLDER_INSTALL: install
+      PS_LANGUAGE: en
+      PS_COUNTRY: pl
+      ADMIN_MAIL: ${ADMIN_MAIL:-admin@example.com}
+      ADMIN_PASSWD: ${ADMIN_PASSWD:-Passw0rd!}
+    ports:
+      - "8080:80"
+    volumes:
+      - ps_data:/var/www/html
+      # Bind-mount the module (repo parent) so code changes are picked up live.
+      - ../:/var/www/html/modules/ifirma
+    networks: [ifirma]
+
+volumes:
+  db_data:
+  ps_data:
+
+networks:
+  ifirma:
+    driver: bridge
