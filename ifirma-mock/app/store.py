@@ -89,6 +89,129 @@ class Document:
         return out
 
 
+# --------------------------------------------------------------------------- #
+# Contractors (kontrahenci)                                                    #
+# --------------------------------------------------------------------------- #
+#: Documented contractor object, in the order iFirma returns it.
+CONTRACTOR_FIELDS = (
+    "Nazwa", "Nazwa2", "Identyfikator", "PrefiksUE", "NIP", "Ulica", "KodPocztowy", "Kraj",
+    "KodKraju", "Miejscowosc", "Email", "Telefon", "OsobaFizyczna", "ZgodaNaEfaktury",
+    "DataUdzieleniaZgody", "EmailDlaFaktury", "JestDostawca", "JestOdbiorca", "AdresZagraniczny",
+    "Skype", "Faks", "Uwagi", "Www", "NazwaBanku", "NumerKonta", "DrugiTelefon",
+    "AdresKorespondencyjnyUlica", "AdresKorespondencyjnyKodPocztowy", "AdresKorespondencyjnyKraj",
+    "AdresKorespondencyjnyMiejscowosc", "PodmiotPowiazany",
+)
+CONTRACTOR_BOOL_FIELDS = frozenset({
+    "OsobaFizyczna", "ZgodaNaEfaktury", "JestDostawca", "JestOdbiorca",
+    "AdresZagraniczny", "PodmiotPowiazany",
+})
+CONTRACTOR_SEARCH_LIMIT = 20
+
+_contractors: dict[str, dict[str, Any]] = {}
+_contractor_seq = itertools.count(1)
+
+
+def contractor_identifier(data: dict[str, Any] | None) -> str | None:
+    """The trimmed Identyfikator of a contractor block, or None when null/empty."""
+    value = (data or {}).get("Identyfikator")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_contractor(data: dict[str, Any], identifier: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in CONTRACTOR_FIELDS:
+        if key == "Identyfikator":
+            out[key] = identifier
+        elif key in CONTRACTOR_BOOL_FIELDS:
+            out[key] = bool(data.get(key))
+        else:
+            out[key] = data.get(key)
+    return out
+
+
+def _new_contractor_identifier() -> str:
+    """Caller must hold _lock."""
+    while True:
+        candidate = "K%06d" % next(_contractor_seq)
+        if candidate not in _contractors:
+            return candidate
+
+
+def contractor_get(identifier: str) -> dict[str, Any] | None:
+    with _lock:
+        return _contractors.get(str(identifier))
+
+
+def contractor_create(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Store a new contractor. Generates an identifier when null/empty.
+
+    Returns None when the identifier already exists (nothing is changed).
+    """
+    with _lock:
+        identifier = contractor_identifier(data)
+        if identifier is None:
+            identifier = _new_contractor_identifier()
+        elif identifier in _contractors:
+            return None
+        stored = _normalize_contractor(data, identifier)
+        _contractors[identifier] = stored
+        return stored
+
+
+def contractor_upsert(data: dict[str, Any]) -> dict[str, Any]:
+    """Create or fully replace a contractor; returns the stored dict."""
+    with _lock:
+        identifier = contractor_identifier(data)
+        if identifier is None:
+            identifier = _new_contractor_identifier()
+        stored = _normalize_contractor(data, identifier)
+        _contractors[identifier] = stored
+        return stored
+
+
+def contractor_update(identifier: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    """Full replace of an existing contractor; the identifier is kept. None when unknown."""
+    with _lock:
+        if identifier not in _contractors:
+            return None
+        stored = _normalize_contractor(data, identifier)
+        _contractors[identifier] = stored
+        return stored
+
+
+def contractor_search(phrase: str) -> list[dict[str, Any]]:
+    """Substring match on Identyfikator, Nazwa or NIP (max CONTRACTOR_SEARCH_LIMIT)."""
+    needle = phrase.strip().lower()
+    digits = "".join(ch for ch in phrase if ch.isdigit())
+    digits_only = bool(digits) and not any(ch.isalpha() for ch in phrase)
+    with _lock:
+        values = list(_contractors.values())
+    out: list[dict[str, Any]] = []
+    for contractor in values:
+        hit = False
+        if needle:
+            haystacks = (contractor["Identyfikator"], contractor["Nazwa"], contractor["NIP"])
+            hit = any(needle in str(h or "").lower() for h in haystacks)
+        if not hit and digits_only:
+            nip_digits = "".join(ch for ch in str(contractor["NIP"] or "") if ch.isdigit())
+            hit = digits in nip_digits
+        if hit:
+            out.append(contractor)
+            if len(out) >= CONTRACTOR_SEARCH_LIMIT:
+                break
+    return out
+
+
+def contractors_reset() -> None:
+    global _contractor_seq
+    with _lock:
+        _contractors.clear()
+        _contractor_seq = itertools.count(1)
+
+
 _documents: dict[int, Document] = {}
 
 

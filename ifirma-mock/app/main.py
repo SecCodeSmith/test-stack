@@ -16,9 +16,14 @@ the same authentication scheme, so the module's HMAC signing is exercised for re
   GET  /iapi/{doc_type}/{id}.json           document detail  (key: faktura)
   POST /iapi/{doc_type}/send/{id}.json      e-mail document  (key: faktura)
   GET  /iapi/abonent/limit.json             API usage limit  (key: abonent)
+  GET  /iapi/kontrahenci/id/{id}.json       contractor by id (key: faktura)
+  POST /iapi/kontrahenci.json               create contractor (key: faktura)
+  PUT  /iapi/kontrahenci/{id}.json          replace contractor (key: faktura)
+  GET  /iapi/kontrahenci/{phrase}.json      search contractors (key: faktura)
 
 Test-only helpers (no HMAC, guarded by IFIRMA_MOCK_TEST_ENDPOINTS):
-  POST /__mock/documents, DELETE /__mock/documents/{id}, POST /__mock/reset
+  POST /__mock/documents, DELETE /__mock/documents/{id}, POST /__mock/contractors,
+  POST /__mock/reset
 
 Docs: https://api.ifirma.pl/
 """
@@ -112,6 +117,26 @@ async def root() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Create receipt / invoice                                                     #
 # --------------------------------------------------------------------------- #
+def _attach_contractor(payload: dict[str, Any]) -> JSONResponse | None:
+    """Mirror iFirma's contractor rules for a document's Kontrahent block.
+
+    A non-empty Identyfikator must name an existing contractor (else Kod 201, nothing
+    is created). A null/empty one makes iFirma create the contractor from the block,
+    and the generated identifier is written back onto the document.
+    """
+    block = payload.get("Kontrahent")
+    if not isinstance(block, dict) or not block:
+        return None
+    identifier = store.contractor_identifier(block)
+    if identifier is None:
+        stored = store.contractor_create(block)
+        payload["Kontrahent"] = {**block, "Identyfikator": stored["Identyfikator"]}
+        return None
+    if store.contractor_get(identifier) is None:
+        return _error(201, "Nie znaleziono kontrahenta o zadanym identyfikatorze")
+    return None
+
+
 @app.post("/iapi/fakturaparagon.json")
 @app.post("/iapi/fakturakraj.json")
 async def create_document(request: Request) -> JSONResponse:
@@ -128,6 +153,10 @@ async def create_document(request: Request) -> JSONResponse:
     positions = payload.get("Pozycje")
     if not positions:
         return _error(400, "Dokument musi zawierać co najmniej jedną pozycję (Pozycje).")
+
+    contractor_err = _attach_contractor(payload)
+    if contractor_err is not None:
+        return contractor_err
 
     doc_type = "fakturaparagon" if request.url.path.endswith("fakturaparagon.json") else "fakturakraj"
     doc = store.create(doc_type, payload)
@@ -339,6 +368,93 @@ async def abonent_limit(request: Request) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Contractors (registered before the generic {doc_type}/{id}.json route)       #
+# --------------------------------------------------------------------------- #
+#: (field, max length) pairs iFirma requires on create and replace.
+CONTRACTOR_REQUIRED = (("Nazwa", 150), ("KodPocztowy", 16), ("Miejscowosc", 65))
+CONTRACTOR_ID_MAX = 15
+
+
+def _contractor_errors(data: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field, max_len in CONTRACTOR_REQUIRED:
+        value = data.get(field)
+        text = "" if value is None else str(value)
+        if not text.strip() or len(text) > max_len:
+            errors.append(field)
+    return errors
+
+
+@app.get("/iapi/kontrahenci/id/{identifier}.json")
+async def contractor_by_id(identifier: str, request: Request) -> JSONResponse:
+    auth_err = await _authorized(request, "faktura", b"")
+    if auth_err is not None:
+        return auth_err
+    found = store.contractor_get(identifier)
+    if found is None:
+        return _error(208, "Nie znaleziono kontrahenta")
+    return JSONResponse({"response": {"Kod": 0, "Informacja": "", "Wynik": [found]}})
+
+
+@app.post("/iapi/kontrahenci.json")
+async def contractor_create(request: Request) -> JSONResponse:
+    raw = await request.body()
+    auth_err = await _authorized(request, "faktura", raw)
+    if auth_err is not None:
+        return auth_err
+
+    data = _parse_body(raw)
+    if not isinstance(data, dict):
+        return _error(400, "Nieprawidłowy JSON w treści żądania.")
+    errors = _contractor_errors(data)
+    if errors:
+        return _error(201, "Validation errors: " + ", ".join(errors))
+    identifier = store.contractor_identifier(data)
+    if identifier is not None and len(identifier) > CONTRACTOR_ID_MAX:
+        return _error(201, f"Identyfikator kontrahenta może mieć maksymalnie {CONTRACTOR_ID_MAX} znaków.")
+    stored = store.contractor_create(data)
+    if stored is None:
+        return _error(201, "Kontrahent o podanym identyfikatorze już istnieje")
+    return JSONResponse(
+        {"response": {"Kod": 0, "Informacja": "Dodano kontrahenta", "Wynik": stored["Identyfikator"]}}
+    )
+
+
+@app.put("/iapi/kontrahenci/{identifier}.json")
+async def contractor_replace(identifier: str, request: Request) -> JSONResponse:
+    raw = await request.body()
+    auth_err = await _authorized(request, "faktura", raw)
+    if auth_err is not None:
+        return auth_err
+
+    data = _parse_body(raw)
+    if not isinstance(data, dict):
+        return _error(400, "Nieprawidłowy JSON w treści żądania.")
+    if store.contractor_get(identifier) is None:
+        return _error(208, "Nie znaleziono kontrahenta")
+    errors = _contractor_errors(data)
+    if errors:
+        return _error(201, "Validation errors: " + ", ".join(errors))
+    stored = store.contractor_update(identifier, data)
+    if stored is None:  # removed between the lookup and the update
+        return _error(208, "Nie znaleziono kontrahenta")
+    return JSONResponse(
+        {"response": {"Kod": 0, "Informacja": "Zaktualizowano kontrahenta", "Wynik": identifier}}
+    )
+
+
+@app.get("/iapi/kontrahenci/{phrase}.json")
+async def contractor_search_route(phrase: str, request: Request) -> JSONResponse:
+    auth_err = await _authorized(request, "faktura", b"")
+    if auth_err is not None:
+        return auth_err
+    matches = store.contractor_search(phrase)
+    if not matches:
+        return _error(208, "Brak wyników")
+    return JSONResponse({"response": {"Kod": 0, "Informacja": "", "Wynik": matches}})
+
+
+# --------------------------------------------------------------------------- #
 # Document detail (JSON)                                                       #
 # --------------------------------------------------------------------------- #
 @app.get("/iapi/{doc_type}/{doc_id}.json")
@@ -419,6 +535,9 @@ async def mock_seed_document(request: Request) -> JSONResponse:
         return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
 
     contractor = dict(body.get("contractor") or {})
+    seeded_id = store.contractor_identifier(contractor)
+    if seeded_id is not None and store.contractor_get(seeded_id) is None:
+        store.contractor_create(contractor)
     positions = body.get("Pozycje")
     if not positions:
         positions = [
@@ -457,6 +576,16 @@ async def mock_seed_document(request: Request) -> JSONResponse:
     return JSONResponse(_row(doc))
 
 
+@app.post("/__mock/contractors")
+async def mock_seed_contractor(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    return JSONResponse(store.contractor_upsert(body))
+
+
 @app.delete("/__mock/documents/{doc_id}")
 async def mock_delete_document(doc_id: str) -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
@@ -471,5 +600,6 @@ async def mock_reset() -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
     store.reset()
+    store.contractors_reset()
     reset_counters()
     return JSONResponse({"reset": True})

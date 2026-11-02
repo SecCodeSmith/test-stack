@@ -38,6 +38,19 @@ behaviour:
 | Document detail | `GET /iapi/{type}/{id}.json` | `faktura` | `{"response":{"Kod":0,"Identyfikator":"…","PelnyNumer":"…","Zaplacono":…,"Uwagi":"…","DodatkoweUwagi":{…}, …}}`; unknown/deleted id → Kod 404 envelope (HTTP 200) |
 | Send by e-mail | `POST /iapi/{type}/send/{id}.json` body `Tekst`, `SkrzynkaEmailOdbiorcy`, … | `faktura` | Kod 0 "Wiadomość została wysłana." for `fakturakraj`, `fakturawysylka`, `fakturaproformakraj`, … ; `fakturaparagon` → Kod 200 (not available); `Tekst` > 1000 → Kod 201 |
 | API usage limit | `GET /iapi/abonent/limit.json` | `abonent` | `{"response":{"Kod":0,"LimitWykorzystany":<calls served>,"LimitPrzyznany":15000}}` |
+| Contractor by id | `GET /iapi/kontrahenci/id/{identifier}.json` | `faktura` | found: `{"response":{"Kod":0,"Informacja":"","Wynik":[<contractor>]}}`; not found: Kod 208 "Nie znaleziono kontrahenta" |
+| Create contractor | `POST /iapi/kontrahenci.json` | `faktura` | Kod 0 "Dodano kontrahenta" with `Wynik` = identifier; missing `Nazwa`/`KodPocztowy`/`Miejscowosc` → Kod 201 `Validation errors: …`; identifier > 15 chars or already existing → Kod 201 |
+| Replace contractor | `PUT /iapi/kontrahenci/{identifier}.json` | `faktura` | Kod 0 "Zaktualizowano kontrahenta" (full replace, identifier kept); unknown → Kod 208 |
+| Search contractors | `GET /iapi/kontrahenci/{phrase}.json` | `faktura` | matches on identifier, `Nazwa` or NIP (max 20) → Kod 0 + `Wynik`; none → Kod 208 "Brak wyników" |
+
+**Contractor rules.** As in production, a document whose `Kontrahent.Identyfikator` is
+non-empty but matches no stored contractor is rejected with Kod 201 "Nie znaleziono
+kontrahenta o zadanym identyfikatorze" and nothing is stored. A null or empty identifier
+makes the mock create the contractor from the `Kontrahent` block with a generated
+identifier (`K000001`, …), which is written back onto the document and shows up as
+`IdentyfikatorKontrahenta` in list rows. Documents seeded through `/__mock/documents`
+register their contractor when its identifier is new; `POST /__mock/contractors` seeds
+one directly (no HMAC) and `/__mock/reset` clears them.
 
 Auth on every call: `Authentication: IAPIS user=<user>, hmac-sha1=<hash>` where
 `hash = HMAC-SHA1(url + user + keyName + body, hex2bin(key))` and the URL is signed
