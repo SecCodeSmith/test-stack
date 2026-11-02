@@ -37,6 +37,10 @@ services:
       # Must equal the module's base URL minus the trailing "/iapi/" path.
       IFIRMA_MOCK_BASE_URL: http://ifirma-mock:8001
       IFIRMA_MOCK_STRICT_AUTH: "true"
+      # Simulated API rate limit: max authenticated calls per minute (0 = off).
+      IFIRMA_MOCK_RATE_LIMIT: ${IFIRMA_MOCK_RATE_LIMIT:-0}
+      # Enables the /__mock/* seeding endpoints (set "false" to get HTTP 404).
+      IFIRMA_MOCK_TEST_ENDPOINTS: ${IFIRMA_MOCK_TEST_ENDPOINTS:-true}
     ports:
       - "8001:8001"
     networks: [ifirma]

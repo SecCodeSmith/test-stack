@@ -38,5 +38,15 @@ class Settings:
     #: When True, requests with a bad/missing HMAC are rejected like the real API.
     strict_auth: bool = _env_bool("IFIRMA_MOCK_STRICT_AUTH", True)
 
+    #: Simulated rate limit: max authenticated calls per calendar minute (0 = off).
+    rate_limit: int = int(os.getenv("IFIRMA_MOCK_RATE_LIMIT", "0") or 0)
+
+    #: Enables the /__mock/* seeding endpoints (HTTP 404 when false).
+    test_endpoints: bool = _env_bool("IFIRMA_MOCK_TEST_ENDPOINTS", True)
+
+    #: The real faktury.json defaults dataDo to dataOd + 30 days. Off by default so the
+    #: original "dataOd=2020-01-01" smoke call still lists freshly created documents.
+    strict_list_window: bool = _env_bool("IFIRMA_MOCK_STRICT_LIST_WINDOW", False)
+
 
 settings = Settings()

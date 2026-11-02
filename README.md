@@ -34,6 +34,10 @@ behaviour:
 | Download PDF | `GET /iapi/{type}/{id}.pdf` (`?typ=dup` = duplicate) | `faktura` | `application/pdf` bytes; JSON error envelope if not found |
 | Register payment | `POST /iapi/faktury/wplaty/{type}/{id}.json` body `{"Kwota":…}` | `faktura` | `{"response":{"Kod":0,"Informacja":"…"}}` |
 | List / read number | `GET /iapi/faktury.json?dataOd=…` | `faktura` | `{"response":{"Kod":0,"Wynik":[{"FakturaId":…,"PelnyNumer":"…", …}]}}` |
+| List filters | `dataOd` (required, else Kod 201), `dataDo`, `kontrahent`, `nipKontrahenta`, `typ`, `status` (comma list of `oplacone,nieoplacone,oplaconeCzesciowo,przeterminowane`), `strona`, `iloscNaStronie`, `kwotaOd`, `kwotaDo` | `faktura` | Rows have the official key order (`KontrahentNazwa` … `KsefStatus`), no total count. Deleted documents are excluded |
+| Document detail | `GET /iapi/{type}/{id}.json` | `faktura` | `{"response":{"Kod":0,"Identyfikator":"…","PelnyNumer":"…","Zaplacono":…,"Uwagi":"…","DodatkoweUwagi":{…}, …}}`; unknown/deleted id → Kod 404 envelope (HTTP 200) |
+| Send by e-mail | `POST /iapi/{type}/send/{id}.json` body `Tekst`, `SkrzynkaEmailOdbiorcy`, … | `faktura` | Kod 0 "Wiadomość została wysłana." for `fakturakraj`, `fakturawysylka`, `fakturaproformakraj`, … ; `fakturaparagon` → Kod 200 (not available); `Tekst` > 1000 → Kod 201 |
+| API usage limit | `GET /iapi/abonent/limit.json` | `abonent` | `{"response":{"Kod":0,"LimitWykorzystany":<calls served>,"LimitPrzyznany":15000}}` |
 
 Auth on every call: `Authentication: IAPIS user=<user>, hmac-sha1=<hash>` where
 `hash = HMAC-SHA1(url + user + keyName + body, hex2bin(key))` and the URL is signed
@@ -111,6 +115,40 @@ so the suite is both a functional test and an executable spec of the auth contra
   HTTP 401, like the real API. Set to `false` to accept anything (logs a warning) when
   you just want to smoke-test wiring.
 
+## Simulating iFirma's own integrator
+
+iFirma's own integrations (shop plugins, marketplaces) create documents the module
+did not issue. Seed such "external" documents through the test-only endpoints (no HMAC):
+
+```bash
+# create an unpaid external receipt (returns the created list row incl. FakturaId)
+curl -X POST http://localhost:8001/__mock/documents -H 'Content-Type: application/json' -d '{
+  "doc_type": "fakturaparagon",
+  "contractor": {"Nazwa": "Jan Kowalski", "Identyfikator": "JAN1", "NIP": "1234567890", "Email": "jan@example.com"},
+  "gross": 123.45, "currency": "PLN", "paid": 0,
+  "uwagi": "Zamówienie 42", "created_by": "external"
+}'
+
+# delete it again (disappears from lists and detail)
+curl -X DELETE http://localhost:8001/__mock/documents/1
+
+# wipe all documents and call counters
+curl -X POST http://localhost:8001/__mock/reset
+```
+
+Accepted body fields: `doc_type`, `contractor`, `gross` or `Pozycje`, `currency`,
+`issue_date`, `due_date`, `uwagi`, `dodatkowe_uwagi`, `draft`, `paid`, `created_by`
+(default `external`), `linked_document`, `ksef_status`, `ksef_number`.
+
+## Mock settings
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `IFIRMA_MOCK_RATE_LIMIT` | `0` (off) | When `N > 0`, the (N+1)th authenticated `/iapi/*` call within a calendar minute is answered with Kod 100 "Przekroczono limit zapytań" |
+| `IFIRMA_MOCK_TEST_ENDPOINTS` | `true` | Enables `/__mock/*`; when `false` they return HTTP 404 |
+| `IFIRMA_MOCK_STRICT_LIST_WINDOW` | `false` | When `true`, `faktury.json` without `dataDo` uses the real API's `dataOd + 30 days` window (off by default so a plain `dataOd=2020-01-01` call still lists new documents) |
+| `IFIRMA_MOCK_KEY_ABONENT` | empty | Key for `abonent/limit.json`; empty means that endpoint always answers 401 |
+
 ## Notes
 
 - `prestashop/prestashop:latest` is used as requested. Pin a tag (e.g.
@@ -119,6 +157,22 @@ so the suite is both a functional test and an executable spec of the auth contra
 - Because the module folder (repo parent) is bind-mounted, its own `test-stack/`
   appears under `modules/ifirma/test-stack` inside the container — harmless; PrestaShop
   only loads `ifirma.php`.
+
+## Module smoke run
+
+With the stack up and PrestaShop installed, run the module's end-to-end smoke script
+inside the PrestaShop container (duplicate guard, data request, delivery, status sync,
+cron, customer visibility), from the repository root:
+
+```bash
+docker compose -f test-stack/docker-compose.yml exec -u www-data prestashop php modules/ifirma/tests/smoke/run.php
+```
+
+Run it as `www-data`: a root-run script leaves root-owned cache directories under `var/cache` and Apache then fails with `unable to create directory`. Repair: `docker compose exec prestashop chown -R www-data:www-data /var/www/html/var`.
+
+It exits non-zero on any failed assertion. It creates real orders in the dev database;
+use `make destroy` to reset. Details, environment overrides and limitations are in
+[`tests/smoke/README.md`](../tests/smoke/README.md).
 
 ## Legal Disclaimer & Trademarks
 
