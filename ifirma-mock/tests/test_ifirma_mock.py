@@ -34,7 +34,7 @@ def create_receipt() -> dict:
         {
             "Zaplacono": 123.45,
             "LiczOd": "BRT",
-            "Kontrahent": {"Nazwa": "Jan Kowalski", "Email": "jan@example.com"},
+            "Kontrahent": {"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Jan Kowalski", "Email": "jan@example.com"},
             "Pozycje": [
                 {"NazwaPelna": "Produkt A", "Ilosc": 1, "CenaJednostkowa": 123.45, "StawkaVat": 0.23, "TypStawkiVat": "PRC"}
             ],

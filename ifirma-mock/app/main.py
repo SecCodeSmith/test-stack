@@ -15,6 +15,7 @@ the same authentication scheme, so the module's HMAC signing is exercised for re
   GET  /iapi/faktury.json                   list documents   (key: faktura; filters + paging)
   GET  /iapi/{doc_type}/{id}.json           document detail  (key: faktura)
   POST /iapi/{doc_type}/send/{id}.json      e-mail document  (key: faktura)
+  POST /iapi/{doc_type}/ksef/send/{id}.json send invoice to KSeF (key: faktura)
   GET  /iapi/abonent/limit.json             API usage limit  (key: abonent)
   GET  /iapi/kontrahenci/id/{id}.json       contractor by id (key: faktura)
   POST /iapi/kontrahenci.json               create contractor (key: faktura)
@@ -23,13 +24,16 @@ the same authentication scheme, so the module's HMAC signing is exercised for re
 
 Test-only helpers (no HMAC, guarded by IFIRMA_MOCK_TEST_ENDPOINTS):
   POST /__mock/documents, DELETE /__mock/documents/{id}, POST /__mock/contractors,
-  POST /__mock/reset
+  POST /__mock/ksef/accept/{id}, POST /__mock/ksef/reject/{id}, POST /__mock/reset,
+  POST|GET /__mock/contractor-mode (create: normal|rename), POST|GET /__mock/pdf-not-ready
 
 Docs: https://api.ifirma.pl/
 """
 from __future__ import annotations
 
 import json
+import re
+import secrets
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -76,7 +80,12 @@ def _register_call() -> bool:
 
 async def _authorized(request: Request, key_name: str, raw_body: bytes) -> JSONResponse | None:
     """Return an error response when auth fails (in strict mode), else None."""
-    result = verify(request.headers.get("Authentication"), request.url.path, key_name, raw_body)
+    # The module signs the URL exactly as sent (percent-encoded path, no query string). Verify
+    # over the raw path first and accept the decoded form as a fallback.
+    raw_path = (request.scope.get("raw_path") or b"").decode("latin-1") or request.url.path
+    result = verify(request.headers.get("Authentication"), raw_path, key_name, raw_body)
+    if not result.ok and raw_path != request.url.path:
+        result = verify(request.headers.get("Authentication"), request.url.path, key_name, raw_body)
     if not result.ok:
         if settings.strict_auth:
             return _error(401, f"Błąd autoryzacji: {result.reason}", http_status=401)
@@ -117,13 +126,38 @@ async def root() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Create receipt / invoice                                                     #
 # --------------------------------------------------------------------------- #
-def _attach_contractor(payload: dict[str, Any]) -> JSONResponse | None:
-    """Mirror iFirma's contractor rules for a document's Kontrahent block.
+def _find_top_level_contractor(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Stored contractor named by the top-level IdentyfikatorKontrahenta or NIPKontrahenta."""
+    identifier = payload.get("IdentyfikatorKontrahenta")
+    if identifier is not None:
+        text = str(identifier).strip()
+        if text:
+            found = store.contractor_get(text)
+            if found is not None:
+                return found
+    nip = payload.get("NIPKontrahenta")
+    if nip is not None:
+        return store.contractor_find_by_nip(str(nip))
+    return None
 
-    A non-empty Identyfikator must name an existing contractor (else Kod 201, nothing
-    is created). A null/empty one makes iFirma create the contractor from the block,
-    and the generated identifier is written back onto the document.
+
+def _attach_contractor(payload: dict[str, Any]) -> JSONResponse | None:
+    """Mirror iFirma's contractor lookup order for a document.
+
+    1. Top-level IdentyfikatorKontrahenta naming a stored contractor: attach it.
+       Unknown is not an error; continue with 2.
+    2. Top-level NIPKontrahenta matching a stored contractor (digits only): attach it.
+       Unknown is not an error; continue with 3.
+    3. Nested Kontrahent block: a non-empty unknown Identyfikator is Kod 201 (nothing
+       is created); a known one is used as-is; a null/empty one creates the contractor
+       from the block and the generated identifier is written back onto the document.
     """
+    stored = _find_top_level_contractor(payload)
+    if stored is not None:
+        block = payload.get("Kontrahent")
+        payload["Kontrahent"] = {**(block if isinstance(block, dict) else {}), **stored}
+        return None
+
     block = payload.get("Kontrahent")
     if not isinstance(block, dict) or not block:
         return None
@@ -134,6 +168,81 @@ def _attach_contractor(payload: dict[str, Any]) -> JSONResponse | None:
         return None
     if store.contractor_get(identifier) is None:
         return _error(201, "Nie znaleziono kontrahenta o zadanym identyfikatorze")
+    return None
+
+
+#: Documented enumeration values (fakturakraj / fakturaparagon). Any other value that is
+#: present in the request is rejected; the live API answers with a generic Kod 200 that
+#: never names the field (observed 2026-11-02 for RodzajPodpisuOdbiorcy: BRK).
+ENUM_RODZAJ_PODPISU_ODBIORCY = ("OUP", "UPO", "BPO", "BWO")
+ENUM_LICZ_OD = ("NET", "BRT")
+ENUM_FORMAT_DATY_SPRZEDAZY = ("DZN", "MSC")
+ENUM_SPOSOB_ZAPLATY = (
+    "GTK", "POB", "PRZ", "KAR", "PZA", "CZK", "KOM", "BAR", "DOT", "PAL", "ALG", "P24", "TPA", "ELE",
+)
+ENUM_TYP_STAWKI_VAT = ("PRC", "ZW")
+#: (document field, allowed values) pairs checked on the document's top level.
+DOCUMENT_ENUMS = (
+    ("RodzajPodpisuOdbiorcy", ENUM_RODZAJ_PODPISU_ODBIORCY),
+    ("LiczOd", ENUM_LICZ_OD),
+    ("FormatDatySprzedazy", ENUM_FORMAT_DATY_SPRZEDAZY),
+    ("SposobZaplaty", ENUM_SPOSOB_ZAPLATY),
+)
+#: (position field, allowed values) pairs checked on every entry of Pozycje.
+POSITION_ENUMS = (("TypStawkiVat", ENUM_TYP_STAWKI_VAT),)
+ENUM_ERROR_KOD = 200
+ENUM_ERROR_INFO = "Niepoprawna zawartość żądania - nie można utworzyć obiektu na podstawie zawartości żądania."
+
+
+def _has_invalid_enum(payload: dict[str, Any]) -> bool:
+    """True when a present enumeration field holds a value outside its documented list.
+
+    Absent keys and null values are not checked here.
+    """
+    def invalid(source: dict[str, Any], enums: tuple) -> bool:
+        for field, allowed in enums:
+            value = source.get(field)
+            if value is not None and value not in allowed:
+                return True
+        return False
+
+    if invalid(payload, DOCUMENT_ENUMS):
+        return True
+    positions = payload.get("Pozycje")
+    if isinstance(positions, list):
+        return any(isinstance(pos, dict) and invalid(pos, POSITION_ENUMS) for pos in positions)
+    return False
+
+
+#: Documented VAT rates for a position's StawkaVat (null is also allowed and not checked here).
+ALLOWED_STAWKA_VAT = (0, 0.05, 0.08, 0.23)
+_STAWKA_VAT_TOLERANCE = 1e-9
+
+
+def _stawka_vat_allowed(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return any(abs(value - allowed) <= _STAWKA_VAT_TOLERANCE for allowed in ALLOWED_STAWKA_VAT)
+
+
+def _document_validation_error(payload: dict[str, Any]) -> str | None:
+    """First documented-rule violation in a document, as the Kod 201 message, or None."""
+    positions = payload.get("Pozycje")
+    if isinstance(positions, list):
+        for i, pos in enumerate(positions):
+            if not isinstance(pos, dict):
+                continue
+            stawka = pos.get("StawkaVat")
+            if stawka is not None and not _stawka_vat_allowed(stawka):
+                return f"Pozycje[{i}].StawkaVat: niedozwolona stawka VAT"
+            if pos.get("TypStawkiVat") == "ZW" and not str(pos.get("PKWiU") or "").strip():
+                return f"Pozycje[{i}].PKWiU: pole wymagane dla stawki ZW"
+
+    block = payload.get("Kontrahent")
+    if isinstance(block, dict):
+        missing = _contractor_errors(block)
+        if missing:
+            return f"Kontrahent.{missing[0]}: pole wymagane"
     return None
 
 
@@ -149,6 +258,13 @@ async def create_document(request: Request) -> JSONResponse:
     payload = _parse_body(raw)
     if payload is None:
         return _error(400, "Nieprawidłowy JSON w treści żądania.")
+
+    if _has_invalid_enum(payload):
+        return _error(ENUM_ERROR_KOD, ENUM_ERROR_INFO)
+
+    validation_error = _document_validation_error(payload)
+    if validation_error is not None:
+        return _error(201, validation_error)
 
     positions = payload.get("Pozycje")
     if not positions:
@@ -210,6 +326,8 @@ async def download_pdf(doc_type: str, doc_id: str, request: Request) -> Response
     auth_err = await _authorized(request, "faktura", b"")
     if auth_err is not None:
         return auth_err
+    if store.pdf_not_ready_consume():
+        return _error(404, f"Nie znaleziono dokumentu {doc_id}.")
 
     try:
         ident = int(doc_id)
@@ -314,6 +432,11 @@ async def list_documents(request: Request) -> JSONResponse:
     except ValueError:
         return _error(201, "Nieprawidłowa kwota.")
 
+    # Live API: a kontrahent identifier that is not in the account is an error, not an empty list.
+    kontrahent = q.get("kontrahent", "").strip()
+    if kontrahent and store.contractor_get(kontrahent) is None:
+        return _error(201, "Nie znaleziono kontrahenta o zadanym identyfikatorze")
+
     nip_filter = "".join(ch for ch in q.get("nipKontrahenta", "") if ch.isdigit())
 
     matched = []
@@ -323,7 +446,7 @@ async def list_documents(request: Request) -> JSONResponse:
         issued = store.parse_date(d.issue_date)
         if issued is None or issued < date_from or (date_to is not None and issued > date_to):
             continue
-        if q.get("kontrahent") and d.contractor_id != q["kontrahent"]:
+        if kontrahent and d.contractor_id != kontrahent:
             continue
         if nip_filter and "".join(c for c in d.contractor_nip if c.isdigit()) != nip_filter:
             continue
@@ -415,8 +538,11 @@ async def contractor_create(request: Request) -> JSONResponse:
     stored = store.contractor_create(data)
     if stored is None:
         return _error(201, "Kontrahent o podanym identyfikatorze już istnieje")
+    # The answer echoes the SENT identifier; in "rename" mode the record is stored under a
+    # generated one (live iFirma behaviour). Without a sent identifier, stored id is echoed.
+    wynik = identifier if identifier is not None else stored["Identyfikator"]
     return JSONResponse(
-        {"response": {"Kod": 0, "Informacja": "Dodano kontrahenta", "Wynik": stored["Identyfikator"]}}
+        {"response": {"Kod": 0, "Informacja": "Dodano kontrahenta", "Wynik": wynik}}
     )
 
 
@@ -477,6 +603,72 @@ async def document_detail(doc_type: str, doc_id: str, request: Request) -> JSONR
     node["Uwagi"] = doc.uwagi
     node["DodatkoweUwagi"] = doc.dodatkowe_uwagi
     return JSONResponse({"response": node})
+
+
+# --------------------------------------------------------------------------- #
+# Send invoice to KSeF                                                         #
+# --------------------------------------------------------------------------- #
+#: Document types accepted by the KSeF send endpoint (documented list).
+KSEF_TYPES = frozenset({
+    "fakturakraj", "fakturakraj/korekta", "fakturawysylka", "fakturazaliczka", "fakturakoncowa",
+    "fakturazaliczkowawaluta", "fakturakoncowawaluta", "fakturaeksporttowarow", "fakturawdt",
+    "fakturaeksportuslugue", "fakturaeksportuslug", "fakturawaluta", "fakturabudowa",
+    "fakturaparagon", "fakturawyposazenie", "fakturasrodektrwaly", "fakturametodakasowa",
+    "fakturaszczegolnyobowiazek", "fakturaoss",
+})
+#: KSeF statuses after which a second send is refused.
+KSEF_SENT_STATES = frozenset({"WYSLANA", "PRZYJETA"})
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _ksef_date_ok(value: Any) -> bool:
+    """DataWysylki is null (send now) or a YYYY-MM-DD calendar date (scheduled)."""
+    if value is None:
+        return True
+    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _find_for_ksef(ident: str) -> store.Document | None:
+    """Active document by digits id, or by number with `_` standing in for `/` (e.g. 314_2026)."""
+    if ident.isascii() and ident.isdigit():
+        return store.get_active(int(ident))
+    number = ident.replace("_", "/")
+    for doc in store.all_documents():
+        if not doc.deleted and doc.number == number:
+            return doc
+    return None
+
+
+@app.post("/iapi/{doc_type:path}/ksef/send/{ident}.json")
+async def ksef_send(doc_type: str, ident: str, request: Request) -> JSONResponse:
+    raw = await request.body()
+    auth_err = await _authorized(request, "faktura", raw)
+    if auth_err is not None:
+        return auth_err
+
+    if doc_type not in KSEF_TYPES:
+        return _error(200, ENUM_ERROR_INFO)
+
+    payload = _parse_body(raw)
+    if not isinstance(payload, dict) or "DataWysylki" not in payload             or not _ksef_date_ok(payload["DataWysylki"]):
+        return _error(201, "DataWysylki: nieprawidłowa wartość")
+
+    doc = _find_for_ksef(ident)
+    if doc is None:
+        return _error(201, "Nie znaleziono faktury o zadanym identyfikatorze")
+
+    scheduled = payload["DataWysylki"] is not None
+    with store.lock():
+        if doc.ksef_status in KSEF_SENT_STATES:
+            return _error(201, "Faktura została już wysłana do KSeF")
+        doc.ksef_status = "ZAPLANOWANA" if scheduled else "WYSLANA"
+    return JSONResponse({"response": {"Kod": 0, "Informacja": "Faktura została wysłana do KSeF."}})
 
 
 # --------------------------------------------------------------------------- #
@@ -558,6 +750,10 @@ async def mock_seed_document(request: Request) -> JSONResponse:
     }
     if body.get("issue_date"):
         payload["DataWystawienia"] = body["issue_date"]
+    payload["DataSprzedazy"] = (
+        body.get("sale_date") or body.get("issue_date") or date.today().isoformat()
+    )
+    payload["FormatDatySprzedazy"] = body.get("sale_date_format") or "DZN"
     if body.get("due_date"):
         payload["TerminPlatnosci"] = body["due_date"]
     if body.get("currency"):
@@ -595,11 +791,79 @@ async def mock_delete_document(doc_id: str) -> JSONResponse:
     return JSONResponse({"deleted": int(doc_id)})
 
 
+@app.post("/__mock/ksef/accept/{doc_id}")
+async def mock_ksef_accept(doc_id: str) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    doc = store.get_active(int(doc_id)) if doc_id.isascii() and doc_id.isdigit() else None
+    if doc is None:
+        return JSONResponse({"detail": "Document not found"}, status_code=404)
+    digits = "".join(ch for ch in str(doc.contractor_nip or "") if ch.isdigit())
+    nip = digits if len(digits) == 10 else "0000000000"
+    with store.lock():
+        doc.ksef_status = "PRZYJETA"
+        doc.ksef_number = (
+            f"{nip}-{date.today():%Y%m%d}-{secrets.token_hex(6).upper()}-{secrets.token_hex(1).upper()}"
+        )
+    return JSONResponse(_row(doc))
+
+
+@app.post("/__mock/ksef/reject/{doc_id}")
+async def mock_ksef_reject(doc_id: str) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    doc = store.get_active(int(doc_id)) if doc_id.isascii() and doc_id.isdigit() else None
+    if doc is None:
+        return JSONResponse({"detail": "Document not found"}, status_code=404)
+    with store.lock():
+        doc.ksef_status = "ODRZUCONA"
+    return JSONResponse(_row(doc))
+
+
 @app.post("/__mock/reset")
 async def mock_reset() -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
     store.reset()
     store.contractors_reset()
+    store.reset_test_switches()
     reset_counters()
     return JSONResponse({"reset": True})
+
+
+@app.post("/__mock/contractor-mode")
+async def mock_set_contractor_mode(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    mode = body.get("create") if isinstance(body, dict) else None
+    if mode not in store.CONTRACTOR_CREATE_MODES:
+        return JSONResponse({"detail": "create must be 'normal' or 'rename'"}, status_code=400)
+    store.set_contractor_create_mode(mode)
+    return JSONResponse({"create": mode})
+
+
+@app.get("/__mock/contractor-mode")
+async def mock_get_contractor_mode() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse({"create": store.contractor_create_mode()})
+
+
+@app.post("/__mock/pdf-not-ready")
+async def mock_set_pdf_not_ready(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    calls = body.get("calls") if isinstance(body, dict) else None
+    if type(calls) is not int or calls < 0:
+        return JSONResponse({"detail": "calls must be a non-negative integer"}, status_code=400)
+    store.set_pdf_not_ready(calls)
+    return JSONResponse({"remaining": store.pdf_not_ready_remaining()})
+
+
+@app.get("/__mock/pdf-not-ready")
+async def mock_get_pdf_not_ready() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse({"remaining": store.pdf_not_ready_remaining()})

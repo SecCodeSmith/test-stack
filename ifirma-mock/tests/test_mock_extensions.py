@@ -124,6 +124,25 @@ def test_list_filter_kontrahent_and_nip():
     assert ids(listing("dataOd=2020-01-01&nipKontrahenta=1111111111")) == {a["FakturaId"]}
 
 
+def test_list_filter_kontrahent_unknown_is_kod_201():
+    seed(contractor={"Nazwa": "A", "Identyfikator": "AAA", "NIP": "111-111-11-11"})
+    resp = get_json("/iapi/faktury.json", "dataOd=2020-01-01&kontrahent=NOPE")
+    assert resp["Kod"] == 201
+    assert resp["Informacja"] == "Nie znaleziono kontrahenta o zadanym identyfikatorze"
+
+
+def test_list_filter_kontrahent_known_returns_only_that_contractor():
+    a = seed(contractor={"Nazwa": "A", "Identyfikator": "AAA", "NIP": "111-111-11-11"})
+    seed(contractor={"Nazwa": "B", "Identyfikator": "BBB", "NIP": "2222222222"})
+    assert ids(listing("dataOd=2020-01-01&kontrahent=AAA")) == {a["FakturaId"]}
+
+
+def test_list_filter_kontrahent_empty_means_no_filter():
+    a = seed(contractor={"Nazwa": "A", "Identyfikator": "AAA", "NIP": "111-111-11-11"})
+    b = seed(contractor={"Nazwa": "B", "Identyfikator": "BBB", "NIP": "2222222222"})
+    assert ids(listing("dataOd=2020-01-01&kontrahent=")) == {a["FakturaId"], b["FakturaId"]}
+
+
 def test_list_filter_typ():
     p = seed(doc_type="fakturaparagon")
     k = seed(doc_type="fakturakraj")
@@ -178,7 +197,7 @@ def test_list_excludes_deleted():
 def test_detail_returns_stamped_notes():
     node = {"Zaplacono": 0, "Uwagi": "Zamowienie 42",
             "DodatkoweUwagi": {"Typ": "NUMER_ZAMOWIENIA", "Info": "REF42"},
-            "Kontrahent": {"Nazwa": "Jan"},
+            "Kontrahent": {"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Jan"},
             "Pozycje": [{"NazwaPelna": "X", "Ilosc": 2, "CenaJednostkowa": 10, "StawkaVat": 0.23}]}
     created = post_json("/iapi/fakturaparagon.json", node)
     ident = created["Identyfikator"]
@@ -279,6 +298,30 @@ def test_seed_creates_listable_external_document():
     assert row["FakturaId"] in ids(listing())
 
 
+def test_seed_sale_date_and_format_are_echoed_in_detail():
+    doc = seed(sale_date="2026-10-05", sale_date_format="MSC")
+    detail = get_json(f"/iapi/fakturaparagon/{doc['FakturaId']}.json")
+    assert detail["DataSprzedazy"] == "2026-10-05"
+    assert detail["FormatDatySprzedazy"] == "MSC"
+
+
+def test_seed_sale_date_defaults_to_issue_date_and_dzn():
+    doc = seed(issue_date="2026-10-07")
+    detail = get_json(f"/iapi/fakturaparagon/{doc['FakturaId']}.json")
+    assert detail["DataSprzedazy"] == "2026-10-07"
+    assert detail["FormatDatySprzedazy"] == "DZN"
+
+
+def test_seed_sale_date_defaults_to_today_without_issue_date():
+    resp = client.post("/__mock/documents", json={
+        "doc_type": "fakturaparagon", "gross": 100,
+        "contractor": {"Nazwa": "Jan", "Identyfikator": "JAN1"}})
+    assert resp.status_code == 200, resp.text
+    detail = get_json(f"/iapi/fakturaparagon/{resp.json()['FakturaId']}.json")
+    assert detail["DataSprzedazy"] == date.today().isoformat()
+    assert detail["FormatDatySprzedazy"] == "DZN"
+
+
 def test_delete_hides_and_unknown_delete_404():
     doc = seed()
     assert client.delete(f"/__mock/documents/{doc['FakturaId']}").status_code == 200
@@ -300,3 +343,36 @@ def test_test_endpoints_disabled_return_404():
     assert client.post("/__mock/documents", json={}).status_code == 404
     assert client.delete("/__mock/documents/1").status_code == 404
     assert client.post("/__mock/reset").status_code == 404
+    assert client.post("/__mock/contractor-mode", json={"create": "rename"}).status_code == 404
+    assert client.post("/__mock/pdf-not-ready", json={"calls": 1}).status_code == 404
+
+
+# ----------------------------- pdf-not-ready (test switch) ------------------ #
+def test_pdf_not_ready_answers_404_envelope_then_serves_pdf():
+    fid = seed()["FakturaId"]
+    path = f"/iapi/fakturaparagon/{fid}.pdf"
+    assert client.post("/__mock/pdf-not-ready", json={"calls": 2}).json() == {"remaining": 2}
+
+    # an unauthenticated request does not consume a count
+    assert client.get(path).status_code == 401
+    assert client.get("/__mock/pdf-not-ready").json() == {"remaining": 2}
+
+    for remaining in (1, 0):
+        resp = client.get(path, headers={"Authentication": sign(path, "faktura", "")})
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json() == {"response": {"Kod": 404, "Informacja": f"Nie znaleziono dokumentu {fid}."}}
+        assert client.get("/__mock/pdf-not-ready").json() == {"remaining": remaining}
+
+    pdf = client.get(path, headers={"Authentication": sign(path, "faktura", "")})
+    assert pdf.headers["content-type"] == "application/pdf"
+    assert pdf.content.startswith(b"%PDF")
+
+
+def test_pdf_not_ready_rejects_bad_counts_and_reset_clears_it():
+    assert client.post("/__mock/pdf-not-ready", json={"calls": -1}).status_code == 400
+    assert client.post("/__mock/pdf-not-ready", json={"calls": "2"}).status_code == 400
+    assert client.post("/__mock/pdf-not-ready", json={}).status_code == 400
+    assert client.post("/__mock/pdf-not-ready", json={"calls": 3}).status_code == 200
+    assert client.post("/__mock/reset").status_code == 200
+    assert client.get("/__mock/pdf-not-ready").json() == {"remaining": 0}

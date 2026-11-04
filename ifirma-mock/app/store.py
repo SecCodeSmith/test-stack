@@ -110,6 +110,11 @@ CONTRACTOR_SEARCH_LIMIT = 20
 _contractors: dict[str, dict[str, Any]] = {}
 _contractor_seq = itertools.count(1)
 
+#: Test-only switches (see /__mock/contractor-mode and /__mock/pdf-not-ready). Guarded by _lock.
+CONTRACTOR_CREATE_MODES = ("normal", "rename")
+_contractor_create_mode = "normal"
+_pdf_not_ready_remaining = 0
+
 
 def contractor_identifier(data: dict[str, Any] | None) -> str | None:
     """The trimmed Identyfikator of a contractor block, or None when null/empty."""
@@ -140,6 +145,15 @@ def _new_contractor_identifier() -> str:
             return candidate
 
 
+def _renamed_contractor_identifier(sent: str) -> str:
+    """Caller must hold _lock. "IFI" + digits of the sent identifier + 6-digit sequence."""
+    digits = "".join(ch for ch in sent if ch.isdigit())
+    while True:
+        candidate = "IFI%s%06d" % (digits, next(_contractor_seq))
+        if candidate not in _contractors:
+            return candidate
+
+
 def contractor_get(identifier: str) -> dict[str, Any] | None:
     with _lock:
         return _contractors.get(str(identifier))
@@ -148,12 +162,17 @@ def contractor_get(identifier: str) -> dict[str, Any] | None:
 def contractor_create(data: dict[str, Any]) -> dict[str, Any] | None:
     """Store a new contractor. Generates an identifier when null/empty.
 
+    In "rename" mode a sent identifier is replaced by a generated one (IFI<digits><seq>)
+    and the record is stored only under that generated identifier.
+
     Returns None when the identifier already exists (nothing is changed).
     """
     with _lock:
         identifier = contractor_identifier(data)
         if identifier is None:
             identifier = _new_contractor_identifier()
+        elif _contractor_create_mode == "rename":
+            identifier = _renamed_contractor_identifier(identifier)
         elif identifier in _contractors:
             return None
         stored = _normalize_contractor(data, identifier)
@@ -180,6 +199,19 @@ def contractor_update(identifier: str, data: dict[str, Any]) -> dict[str, Any] |
         stored = _normalize_contractor(data, identifier)
         _contractors[identifier] = stored
         return stored
+
+
+def contractor_find_by_nip(nip: str) -> dict[str, Any] | None:
+    """First stored contractor whose NIP has the same digits as `nip` (None for empty input)."""
+    digits = "".join(ch for ch in str(nip or "") if ch.isdigit())
+    if not digits:
+        return None
+    with _lock:
+        values = list(_contractors.values())
+    for contractor in values:
+        if "".join(ch for ch in str(contractor["NIP"] or "") if ch.isdigit()) == digits:
+            return contractor
+    return None
 
 
 def contractor_search(phrase: str) -> list[dict[str, Any]]:
@@ -210,6 +242,49 @@ def contractors_reset() -> None:
     with _lock:
         _contractors.clear()
         _contractor_seq = itertools.count(1)
+
+
+def set_contractor_create_mode(mode: str) -> None:
+    global _contractor_create_mode
+    if mode not in CONTRACTOR_CREATE_MODES:
+        raise ValueError(f"unknown contractor create mode: {mode!r}")
+    with _lock:
+        _contractor_create_mode = mode
+
+
+def contractor_create_mode() -> str:
+    with _lock:
+        return _contractor_create_mode
+
+
+def set_pdf_not_ready(calls: int) -> None:
+    """Make the next `calls` PDF downloads answer Kod 404 (replaces any pending count)."""
+    global _pdf_not_ready_remaining
+    with _lock:
+        _pdf_not_ready_remaining = max(0, int(calls))
+
+
+def pdf_not_ready_remaining() -> int:
+    with _lock:
+        return _pdf_not_ready_remaining
+
+
+def pdf_not_ready_consume() -> bool:
+    """True (and one count consumed) while the PDF-not-ready counter is above zero."""
+    global _pdf_not_ready_remaining
+    with _lock:
+        if _pdf_not_ready_remaining <= 0:
+            return False
+        _pdf_not_ready_remaining -= 1
+        return True
+
+
+def reset_test_switches() -> None:
+    """Restore normal contractor creation and clear the PDF-not-ready counter."""
+    global _contractor_create_mode, _pdf_not_ready_remaining
+    with _lock:
+        _contractor_create_mode = "normal"
+        _pdf_not_ready_remaining = 0
 
 
 _documents: dict[int, Document] = {}

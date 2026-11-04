@@ -207,7 +207,7 @@ def test_search_caps_results_at_20():
 
 # ----------------------------- documents ------------------------------------ #
 def test_document_with_unknown_identifier_is_rejected_and_stores_nothing():
-    resp = receipt({"Nazwa": "Ktoś", "Identyfikator": "NIEMA"})
+    resp = receipt({"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Ktoś", "Identyfikator": "NIEMA"})
     assert resp["Kod"] == 201
     assert resp["Informacja"] == "Nie znaleziono kontrahenta o zadanym identyfikatorze"
     assert listing() == []
@@ -215,7 +215,7 @@ def test_document_with_unknown_identifier_is_rejected_and_stores_nothing():
 
 
 def test_document_with_null_identifier_auto_creates_contractor():
-    resp = receipt({"Nazwa": "Jan Kowalski", "Identyfikator": None, "Email": "jan@example.com"})
+    resp = receipt({"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Jan Kowalski", "Identyfikator": None, "Email": "jan@example.com"})
     assert resp["Kod"] == 0
     rows = listing()
     assert len(rows) == 1
@@ -228,7 +228,7 @@ def test_document_with_null_identifier_auto_creates_contractor():
 
 
 def test_document_with_empty_identifier_auto_creates_contractor():
-    assert receipt({"Nazwa": "Anna", "Identyfikator": ""})["Kod"] == 0
+    assert receipt({"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Anna", "Identyfikator": ""})["Kod"] == 0
     identifier = listing()[0]["IdentyfikatorKontrahenta"]
     assert GENERATED_ID.match(identifier)
     assert by_id(identifier)["Kod"] == 0
@@ -236,7 +236,7 @@ def test_document_with_empty_identifier_auto_creates_contractor():
 
 def test_document_with_existing_identifier_succeeds():
     create_contractor(contractor(Identyfikator="FIRMA1"))
-    assert receipt({"Nazwa": "Firma Testowa", "Identyfikator": "FIRMA1"})["Kod"] == 0
+    assert receipt({"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Firma Testowa", "Identyfikator": "FIRMA1"})["Kod"] == 0
     row = listing()[0]
     assert row["IdentyfikatorKontrahenta"] == "FIRMA1"
     assert row["KontrahentNazwa"] == "Firma Testowa"
@@ -245,6 +245,58 @@ def test_document_with_existing_identifier_succeeds():
 def test_document_without_kontrahent_block_still_works():
     assert receipt(None)["Kod"] == 0
     assert listing()[0]["IdentyfikatorKontrahenta"] == ""
+
+
+def document(extra: dict, kontrahent: dict | None = None) -> dict:
+    """A receipt with top-level lookup keys (IdentyfikatorKontrahenta / NIPKontrahenta)."""
+    payload = {"Pozycje": POSITIONS, **extra}
+    if kontrahent is not None:
+        payload["Kontrahent"] = kontrahent
+    return send_json("post", RECEIPT, payload)
+
+
+def test_top_level_identifier_attaches_stored_contractor_and_ignores_block_name():
+    create_contractor(contractor(Identyfikator="FIRMA1"))
+    resp = document({"IdentyfikatorKontrahenta": "FIRMA1"}, {"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Ktoś inny", "Identyfikator": None})
+    assert resp["Kod"] == 0
+    row = listing()[0]
+    assert row["IdentyfikatorKontrahenta"] == "FIRMA1"
+    assert row["KontrahentNazwa"] == "Firma Testowa Sp. z o.o."
+    assert by_id("FIRMA1")["Wynik"][0]["Nazwa"] == "Firma Testowa Sp. z o.o."
+
+
+def test_top_level_unknown_identifier_without_nip_creates_contractor_from_block():
+    resp = document({"IdentyfikatorKontrahenta": "NIEMA"}, {"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Jan Kowalski", "Identyfikator": None})
+    assert resp["Kod"] == 0
+    row = listing()[0]
+    assert GENERATED_ID.match(row["IdentyfikatorKontrahenta"])
+    assert row["IdentyfikatorKontrahenta"] != "NIEMA"
+    assert row["KontrahentNazwa"] == "Jan Kowalski"
+    assert by_id(row["IdentyfikatorKontrahenta"])["Wynik"][0]["Nazwa"] == "Jan Kowalski"
+    assert by_id("NIEMA")["Kod"] == 208
+
+
+def test_nip_keyword_attaches_contractor_stored_with_dashes():
+    create_contractor(contractor(Identyfikator="FIRMA1", NIP="525-252-52-52"))
+    resp = document({"NIPKontrahenta": "5252525252"}, {"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Ktoś inny", "Identyfikator": None})
+    assert resp["Kod"] == 0
+    row = listing()[0]
+    assert row["IdentyfikatorKontrahenta"] == "FIRMA1"
+    assert row["NIPKontrahenta"] == "525-252-52-52"
+
+
+def test_nested_unknown_identifier_without_top_level_fields_is_201():
+    create_contractor(contractor(Identyfikator="FIRMA1"))
+    resp = document({}, {"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Ktoś", "Identyfikator": "NIEMA"})
+    assert resp == {"Kod": 201, "Informacja": "Nie znaleziono kontrahenta o zadanym identyfikatorze"}
+    assert listing() == []
+
+
+def test_top_level_identifier_longer_than_15_chars_is_accepted_by_mock():
+    client.post("/__mock/contractors", json=contractor(Identyfikator="EC_JACEK ORZECHO"))
+    resp = document({"IdentyfikatorKontrahenta": "EC_JACEK ORZECHO"})
+    assert resp["Kod"] == 0
+    assert listing()[0]["IdentyfikatorKontrahenta"] == "EC_JACEK ORZECHO"
 
 
 # ----------------------------- test endpoints ------------------------------- #
@@ -259,7 +311,7 @@ def test_document_seeding_registers_unknown_contractor():
     assert by_id("SEED1")["Wynik"][0]["Nazwa"] == "Seed"
     # a seeded document with a registered contractor behaves like any other: the
     # identifier can be used on the next create
-    assert receipt({"Nazwa": "Seed", "Identyfikator": "SEED1"})["Kod"] == 0
+    assert receipt({"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Seed", "Identyfikator": "SEED1"})["Kod"] == 0
 
 
 def test_document_seeding_keeps_existing_contractor():
@@ -294,3 +346,55 @@ def test_reset_clears_contractors():
     assert by_id("FIRMA1")["Kod"] == 208
     # generated identifiers restart from the beginning after a reset
     assert GENERATED_ID.match(create_contractor(contractor(Identyfikator=None))["Wynik"])
+
+
+def test_search_with_encoded_phrase_signed_over_raw_path():
+    """The module signs the percent-encoded URL it sends; the mock must accept that form."""
+    seed = client.post("/__mock/contractors", json={"Identyfikator": "JD-01", "Nazwa": "John DOE", "KodPocztowy": "00-001", "Miejscowosc": "Warszawa"})
+    assert seed.status_code == 200, seed.text
+    path = "/iapi/kontrahenci/John%20DOE.json"
+    resp = client.get(path, headers={"Authentication": sign(path, "faktura", "")})
+    assert resp.status_code == 200, resp.text
+    node = resp.json()["response"]
+    assert node["Kod"] == 0 and node["Wynik"][0]["Identyfikator"] == "JD-01"
+
+
+# ----------------------------- rename mode (test switch) -------------------- #
+def set_contractor_mode(mode: str):
+    return client.post("/__mock/contractor-mode", json={"create": mode})
+
+
+def test_contractor_mode_defaults_to_normal_and_rejects_unknown_values():
+    assert client.get("/__mock/contractor-mode").json() == {"create": "normal"}
+    assert set_contractor_mode("bogus").status_code == 400
+    assert client.get("/__mock/contractor-mode").json() == {"create": "normal"}
+
+
+def test_rename_mode_stores_under_generated_id_and_echoes_sent_id():
+    assert set_contractor_mode("rename").status_code == 200
+    assert client.get("/__mock/contractor-mode").json() == {"create": "rename"}
+
+    resp = create_contractor(contractor(Identyfikator="PS-C7"))
+    assert resp == {"Kod": 0, "Informacja": "Dodano kontrahenta", "Wynik": "PS-C7"}
+    assert by_id("PS-C7") == {"Kod": 208, "Informacja": "Nie znaleziono kontrahenta"}
+
+    rows = get_json("/iapi/kontrahenci/5252525252.json")["Wynik"]
+    assert len(rows) == 1
+    assert rows[0]["Identyfikator"] == "IFI7000001"
+    assert by_id("IFI7000001")["Wynik"][0]["Nazwa"] == "Firma Testowa Sp. z o.o."
+
+
+def test_rename_mode_keeps_generated_identifier_for_null_identifier():
+    set_contractor_mode("rename")
+    resp = create_contractor(contractor(Identyfikator=None))
+    assert resp["Kod"] == 0
+    assert GENERATED_ID.match(resp["Wynik"])
+    assert by_id(resp["Wynik"])["Kod"] == 0
+
+
+def test_reset_restores_normal_contractor_mode():
+    set_contractor_mode("rename")
+    assert client.post("/__mock/reset").status_code == 200
+    assert client.get("/__mock/contractor-mode").json() == {"create": "normal"}
+    assert create_contractor(contractor(Identyfikator="PS-C7"))["Wynik"] == "PS-C7"
+    assert by_id("PS-C7")["Kod"] == 0
