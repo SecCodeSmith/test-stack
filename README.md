@@ -1,7 +1,8 @@
 # iFirma MockAPI for testing 
 
-A self-contained test harness for the PrestaShop **`ifirma`** module. It is its own
-git repository (push it to GitHub as a separate repo) and provides:
+A self-contained test harness for the PrestaShop **`ifirma`** module. It lives at
+<https://github.com/SecCodeSmith/test-stack> and is consumed by the iFirma module repo as the
+`test-stack` git submodule (clone the module with `--recurse-submodules`) and provides:
 
 - **`ifirma-mock/`** — a **FastAPI** service that mocks the iFirma API. It implements
   the exact endpoints the module calls **and validates the module's HMAC-SHA1
@@ -229,7 +230,7 @@ Run it as `www-data`: a root-run script leaves root-owned cache directories unde
 
 It exits non-zero on any failed assertion. It creates real orders in the dev database;
 use `make destroy` to reset. Details, environment overrides and limitations are in
-[`tests/smoke/README.md`](../tests/smoke/README.md).
+`tests/smoke/README.md` of the iFirma module repository (the parent checkout that contains this submodule).
 
 ## Legal Disclaimer & Trademarks
 
