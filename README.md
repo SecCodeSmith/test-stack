@@ -162,7 +162,7 @@ curl -X DELETE http://localhost:8001/__mock/documents/1
 curl -X POST http://localhost:8001/__mock/reset
 ```
 
-Two switches reproduce iFirma behaviour the module must handle. Both are test-only (no HMAC,
+Three switches reproduce iFirma behaviour the module must handle. All are test-only (no HMAC,
 disabled with `IFIRMA_MOCK_TEST_ENDPOINTS=false`) and are restored to their defaults by `/__mock/reset`:
 
 ```bash
@@ -177,7 +177,20 @@ curl http://localhost:8001/__mock/contractor-mode   # {"create": "rename"}
 # {"response": {"Kod": 404, "Informacja": "Nie znaleziono dokumentu <id>."}} (HTTP 200), then the PDF is served again.
 curl -X POST http://localhost:8001/__mock/pdf-not-ready -H 'Content-Type: application/json' -d '{"calls": 2}'
 curl http://localhost:8001/__mock/pdf-not-ready     # {"remaining": 2}
+
+# legacy mode (off by default): for the upgrade test from 1.0.0 of the module, which sends
+# RodzajPodpisuOdbiorcy BRK, a 4-decimal StawkaVat such as 0.2301 and an e-mail as the contractor
+# Identyfikator. While on, a new document may carry any RodzajPodpisuOdbiorcy, any StawkaVat and an
+# unknown nested Kontrahent.Identyfikator, which the mock then creates under that identifier.
+# Every other rule still applies (LiczOd, TypStawkiVat ZW needs PKWiU, required Kontrahent fields,
+# non-empty Pozycje). Cleared by /__mock/reset.
+curl -X POST http://localhost:8001/__mock/legacy-mode -H 'Content-Type: application/json' -d '{"enabled": true}'
+curl http://localhost:8001/__mock/legacy-mode       # {"enabled": true}
 ```
+
+The upgrade test from 1.0.0 mounts the 1.0.0 tree of the module instead of the working tree with
+`docker-compose.upgrade-1.0.0.yml` (set `IFIRMA_1_0_0_DIR` to the 1.0.0 worktree path as docker sees it;
+the file's header has the exact `docker compose -f ... -f ... up` command).
 
 KSeF status helpers (no HMAC) simulate the outcome of a KSeF submission, which the real
 API reports asynchronously. `accept` sets `KsefStatus` to `PRZYJETA` and assigns a mock

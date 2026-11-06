@@ -110,10 +110,12 @@ CONTRACTOR_SEARCH_LIMIT = 20
 _contractors: dict[str, dict[str, Any]] = {}
 _contractor_seq = itertools.count(1)
 
-#: Test-only switches (see /__mock/contractor-mode and /__mock/pdf-not-ready). Guarded by _lock.
+#: Test-only switches (see /__mock/contractor-mode, /__mock/pdf-not-ready and
+#: /__mock/legacy-mode). Guarded by _lock.
 CONTRACTOR_CREATE_MODES = ("normal", "rename")
 _contractor_create_mode = "normal"
 _pdf_not_ready_remaining = 0
+_legacy_mode = False
 
 
 def contractor_identifier(data: dict[str, Any] | None) -> str | None:
@@ -279,12 +281,24 @@ def pdf_not_ready_consume() -> bool:
         return True
 
 
+def set_legacy_mode(enabled: bool) -> None:
+    global _legacy_mode
+    with _lock:
+        _legacy_mode = bool(enabled)
+
+
+def legacy_mode() -> bool:
+    with _lock:
+        return _legacy_mode
+
+
 def reset_test_switches() -> None:
-    """Restore normal contractor creation and clear the PDF-not-ready counter."""
-    global _contractor_create_mode, _pdf_not_ready_remaining
+    """Restore normal contractor creation, clear the PDF-not-ready counter and legacy mode."""
+    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode
     with _lock:
         _contractor_create_mode = "normal"
         _pdf_not_ready_remaining = 0
+        _legacy_mode = False
 
 
 _documents: dict[int, Document] = {}

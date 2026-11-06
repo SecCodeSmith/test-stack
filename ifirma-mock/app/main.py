@@ -25,7 +25,8 @@ the same authentication scheme, so the module's HMAC signing is exercised for re
 Test-only helpers (no HMAC, guarded by IFIRMA_MOCK_TEST_ENDPOINTS):
   POST /__mock/documents, DELETE /__mock/documents/{id}, POST /__mock/contractors,
   POST /__mock/ksef/accept/{id}, POST /__mock/ksef/reject/{id}, POST /__mock/reset,
-  POST|GET /__mock/contractor-mode (create: normal|rename), POST|GET /__mock/pdf-not-ready
+  POST|GET /__mock/contractor-mode (create: normal|rename), POST|GET /__mock/pdf-not-ready,
+  POST|GET /__mock/legacy-mode (enabled: true|false)
 
 Docs: https://api.ifirma.pl/
 """
@@ -141,7 +142,7 @@ def _find_top_level_contractor(payload: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
-def _attach_contractor(payload: dict[str, Any]) -> JSONResponse | None:
+def _attach_contractor(payload: dict[str, Any], legacy: bool = False) -> JSONResponse | None:
     """Mirror iFirma's contractor lookup order for a document.
 
     1. Top-level IdentyfikatorKontrahenta naming a stored contractor: attach it.
@@ -149,8 +150,10 @@ def _attach_contractor(payload: dict[str, Any]) -> JSONResponse | None:
     2. Top-level NIPKontrahenta matching a stored contractor (digits only): attach it.
        Unknown is not an error; continue with 3.
     3. Nested Kontrahent block: a non-empty unknown Identyfikator is Kod 201 (nothing
-       is created); a known one is used as-is; a null/empty one creates the contractor
-       from the block and the generated identifier is written back onto the document.
+       is created) unless legacy=True, in which case it creates the contractor from the
+       block under that identifier; a known one is used as-is; a null/empty one creates
+       the contractor from the block and the generated identifier is written back onto
+       the document.
     """
     stored = _find_top_level_contractor(payload)
     if stored is not None:
@@ -167,7 +170,10 @@ def _attach_contractor(payload: dict[str, Any]) -> JSONResponse | None:
         payload["Kontrahent"] = {**block, "Identyfikator": stored["Identyfikator"]}
         return None
     if store.contractor_get(identifier) is None:
-        return _error(201, "Nie znaleziono kontrahenta o zadanym identyfikatorze")
+        if not legacy:
+            return _error(201, "Nie znaleziono kontrahenta o zadanym identyfikatorze")
+        stored = store.contractor_create(block)
+        payload["Kontrahent"] = {**block, "Identyfikator": stored["Identyfikator"]}
     return None
 
 
@@ -194,10 +200,11 @@ ENUM_ERROR_KOD = 200
 ENUM_ERROR_INFO = "Niepoprawna zawartość żądania - nie można utworzyć obiektu na podstawie zawartości żądania."
 
 
-def _has_invalid_enum(payload: dict[str, Any]) -> bool:
+def _has_invalid_enum(payload: dict[str, Any], legacy: bool = False) -> bool:
     """True when a present enumeration field holds a value outside its documented list.
 
-    Absent keys and null values are not checked here.
+    Absent keys and null values are not checked here. With legacy=True the
+    RodzajPodpisuOdbiorcy pair is skipped (any value accepted); nothing else changes.
     """
     def invalid(source: dict[str, Any], enums: tuple) -> bool:
         for field, allowed in enums:
@@ -206,7 +213,10 @@ def _has_invalid_enum(payload: dict[str, Any]) -> bool:
                 return True
         return False
 
-    if invalid(payload, DOCUMENT_ENUMS):
+    document_enums = DOCUMENT_ENUMS
+    if legacy:
+        document_enums = tuple(pair for pair in DOCUMENT_ENUMS if pair[0] != "RodzajPodpisuOdbiorcy")
+    if invalid(payload, document_enums):
         return True
     positions = payload.get("Pozycje")
     if isinstance(positions, list):
@@ -225,15 +235,19 @@ def _stawka_vat_allowed(value: Any) -> bool:
     return any(abs(value - allowed) <= _STAWKA_VAT_TOLERANCE for allowed in ALLOWED_STAWKA_VAT)
 
 
-def _document_validation_error(payload: dict[str, Any]) -> str | None:
-    """First documented-rule violation in a document, as the Kod 201 message, or None."""
+def _document_validation_error(payload: dict[str, Any], legacy: bool = False) -> str | None:
+    """First documented-rule violation in a document, as the Kod 201 message, or None.
+
+    With legacy=True the StawkaVat check is skipped (any rate accepted); the PKWiU-for-ZW
+    and Kontrahent required-field rules still apply.
+    """
     positions = payload.get("Pozycje")
     if isinstance(positions, list):
         for i, pos in enumerate(positions):
             if not isinstance(pos, dict):
                 continue
             stawka = pos.get("StawkaVat")
-            if stawka is not None and not _stawka_vat_allowed(stawka):
+            if not legacy and stawka is not None and not _stawka_vat_allowed(stawka):
                 return f"Pozycje[{i}].StawkaVat: niedozwolona stawka VAT"
             if pos.get("TypStawkiVat") == "ZW" and not str(pos.get("PKWiU") or "").strip():
                 return f"Pozycje[{i}].PKWiU: pole wymagane dla stawki ZW"
@@ -259,10 +273,14 @@ async def create_document(request: Request) -> JSONResponse:
     if payload is None:
         return _error(400, "Nieprawidłowy JSON w treści żądania.")
 
-    if _has_invalid_enum(payload):
+    # Legacy mode (test switch, off by default) relaxes three rules for the upgrade test from
+    # 1.0.0 of the module, which sends RodzajPodpisuOdbiorcy BRK, a 4-decimal StawkaVat such as
+    # 0.2301 and an e-mail as the contractor Identyfikator. Nothing else is relaxed.
+    legacy = store.legacy_mode()
+    if _has_invalid_enum(payload, legacy=legacy):
         return _error(ENUM_ERROR_KOD, ENUM_ERROR_INFO)
 
-    validation_error = _document_validation_error(payload)
+    validation_error = _document_validation_error(payload, legacy=legacy)
     if validation_error is not None:
         return _error(201, validation_error)
 
@@ -270,7 +288,7 @@ async def create_document(request: Request) -> JSONResponse:
     if not positions:
         return _error(400, "Dokument musi zawierać co najmniej jedną pozycję (Pozycje).")
 
-    contractor_err = _attach_contractor(payload)
+    contractor_err = _attach_contractor(payload, legacy=legacy)
     if contractor_err is not None:
         return contractor_err
 
@@ -867,3 +885,22 @@ async def mock_get_pdf_not_ready() -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
     return JSONResponse({"remaining": store.pdf_not_ready_remaining()})
+
+
+@app.post("/__mock/legacy-mode")
+async def mock_set_legacy_mode(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if type(enabled) is not bool:
+        return JSONResponse({"detail": "enabled must be true or false"}, status_code=400)
+    store.set_legacy_mode(enabled)
+    return JSONResponse({"enabled": enabled})
+
+
+@app.get("/__mock/legacy-mode")
+async def mock_get_legacy_mode() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse({"enabled": store.legacy_mode()})

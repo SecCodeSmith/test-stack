@@ -1,0 +1,10 @@
+# Upgrade test from 1.0.0 (see tests/smoke/README.md of the ifirma module): mounts the 1.0.0 tree
+# of the module instead of the working tree. IFIRMA_1_0_0_DIR is the path of the 1.0.0 worktree
+# as docker sees it (under WSL: /mnt/c/...). Add this file after docker-compose.yml:
+#   IFIRMA_1_0_0_DIR=/path/to/ifirma-1.0.0 docker compose -f docker-compose.yml \
+#     -f docker-compose.upgrade-1.0.0.yml up -d --no-deps --force-recreate prestashop
+services:
+  prestashop:
+    volumes:
+      - ps_data:/var/www/html
+      - ${IFIRMA_1_0_0_DIR:?set IFIRMA_1_0_0_DIR to the path of the 1.0.0 worktree}:/var/www/html/modules/ifirma
