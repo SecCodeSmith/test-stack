@@ -26,28 +26,42 @@ Test-only helpers (no HMAC, guarded by IFIRMA_MOCK_TEST_ENDPOINTS):
   POST /__mock/documents, DELETE /__mock/documents/{id}, POST /__mock/contractors,
   POST /__mock/ksef/accept/{id}, POST /__mock/ksef/reject/{id}, POST /__mock/reset,
   POST|GET /__mock/contractor-mode (create: normal|rename), POST|GET /__mock/pdf-not-ready,
-  POST|GET /__mock/legacy-mode (enabled: true|false)
+  POST|GET /__mock/legacy-mode (enabled: true|false),
+  GET /__mock/status (HTML status page), GET /__mock/status.json, and the page's form
+  routes POST /__mock/ui/{seed|switch/{name}|documents/{id}/{action}|reset} (303 back to the page)
+
+State: kept in memory, and in the JSON file IFIRMA_MOCK_STATE_FILE when set (see state.py);
+IFIRMA_MOCK_CLEAN_START=true discards that file at start-up.
 
 Docs: https://api.ifirma.pl/
 """
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
-import time
+from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Any
+from urllib.parse import quote_plus
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from . import store
+from . import state, store, ui
 from .auth import verify
 from .config import settings
 from .pdf import build_pdf
 
-app = FastAPI(title="iFirma Mock API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    state.start(settings)
+    yield
+
+
+app = FastAPI(title="iFirma Mock API", version="1.1.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -58,25 +72,16 @@ def _error(kod: int, info: str, http_status: int = 200) -> JSONResponse:
     return JSONResponse({"response": {"Kod": kod, "Informacja": info}}, status_code=http_status)
 
 
-# Authenticated-call accounting (feeds abonent/limit.json and the rate-limit simulation).
-_calls: dict[str, Any] = {"total": 0, "minute": None, "minute_count": 0}
+# Authenticated-call accounting lives in the store (feeds abonent/limit.json and the
+# rate-limit simulation).
 LIMIT_GRANTED = 15000
-
-
-def reset_counters() -> None:
-    _calls.update(total=0, minute=None, minute_count=0)
 
 
 def _register_call() -> bool:
     """Count an authenticated call; return False when the simulated rate limit is exceeded."""
-    minute = int(time.time() // 60)
-    if _calls["minute"] != minute:
-        _calls["minute"] = minute
-        _calls["minute_count"] = 0
-    _calls["total"] += 1
-    _calls["minute_count"] += 1
+    this_minute = store.register_call()
     limit = settings.rate_limit
-    return not (limit > 0 and _calls["minute_count"] > limit)
+    return not (limit > 0 and this_minute > limit)
 
 
 async def _authorized(request: Request, key_name: str, raw_body: bytes) -> JSONResponse | None:
@@ -121,6 +126,7 @@ async def root() -> dict[str, Any]:
         "base_url": settings.base_url,
         "strict_auth": settings.strict_auth,
         "documents_issued": len(store.all_documents()),
+        "status_page": "/__mock/status",
     }
 
 
@@ -501,7 +507,7 @@ async def abonent_limit(request: Request) -> JSONResponse:
             "response": {
                 "Kod": 0,
                 "Informacja": "",
-                "LimitWykorzystany": _calls["total"],
+                "LimitWykorzystany": store.calls_total(),
                 "LimitPrzyznany": LIMIT_GRANTED,
             }
         }
@@ -682,10 +688,9 @@ async def ksef_send(doc_type: str, ident: str, request: Request) -> JSONResponse
         return _error(201, "Nie znaleziono faktury o zadanym identyfikatorze")
 
     scheduled = payload["DataWysylki"] is not None
-    with store.lock():
-        if doc.ksef_status in KSEF_SENT_STATES:
-            return _error(201, "Faktura została już wysłana do KSeF")
-        doc.ksef_status = "ZAPLANOWANA" if scheduled else "WYSLANA"
+    if doc.ksef_status in KSEF_SENT_STATES:
+        return _error(201, "Faktura została już wysłana do KSeF")
+    store.set_ksef_status(doc.ifirma_id, "ZAPLANOWANA" if scheduled else "WYSLANA")
     return JSONResponse({"response": {"Kod": 0, "Informacja": "Faktura została wysłana do KSeF."}})
 
 
@@ -720,10 +725,7 @@ async def send_document(doc_type: str, doc_id: str, request: Request) -> JSONRes
         return _error(201, "Pole Tekst może mieć maksymalnie 1000 znaków.")
 
     recipient = payload.get("SkrzynkaEmailOdbiorcy") or doc.contractor_email
-    with store.lock():
-        doc.sent = True
-        if recipient:
-            doc.sent_to.append(str(recipient))
+    store.mark_sent(doc.ifirma_id, str(recipient) if recipient else None)
     return JSONResponse({"response": {"Kod": 0, "Informacja": "Wiadomość została wysłana."}})
 
 
@@ -736,14 +738,8 @@ def _test_endpoints_disabled() -> JSONResponse | None:
     return None
 
 
-@app.post("/__mock/documents")
-async def mock_seed_document(request: Request) -> JSONResponse:
-    if (off := _test_endpoints_disabled()) is not None:
-        return off
-    body = _parse_body(await request.body())
-    if body is None:
-        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
-
+def seed_document(body: dict[str, Any]) -> dict[str, Any]:
+    """Store a document from a seed body (shared by the JSON helper and the status page)."""
     contractor = dict(body.get("contractor") or {})
     seeded_id = store.contractor_identifier(contractor)
     if seeded_id is not None and store.contractor_get(seeded_id) is None:
@@ -787,7 +783,17 @@ async def mock_seed_document(request: Request) -> JSONResponse:
         ksef_status=body.get("ksef_status"),
         ksef_number=body.get("ksef_number"),
     )
-    return JSONResponse(_row(doc))
+    return _row(doc)
+
+
+@app.post("/__mock/documents")
+async def mock_seed_document(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    if body is None:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    return JSONResponse(seed_document(body))
 
 
 @app.post("/__mock/contractors")
@@ -800,11 +806,34 @@ async def mock_seed_contractor(request: Request) -> JSONResponse:
     return JSONResponse(store.contractor_upsert(body))
 
 
+def delete_document(doc_id: str) -> bool:
+    """Soft-delete a document; False when the id is not a stored document."""
+    return doc_id.isdigit() and store.mark_deleted(int(doc_id))
+
+
+def ksef_outcome(doc_id: str, accepted: bool) -> dict[str, Any] | None:
+    """Set the KSeF outcome of a stored document; its row, or None when the id is unknown."""
+    doc = store.get_active(int(doc_id)) if doc_id.isascii() and doc_id.isdigit() else None
+    if doc is None:
+        return None
+    if not accepted:
+        store.set_ksef_status(doc.ifirma_id, "ODRZUCONA")
+        return _row(doc)
+    digits = "".join(ch for ch in str(doc.contractor_nip or "") if ch.isdigit())
+    nip = digits if len(digits) == 10 else "0000000000"
+    store.set_ksef_status(
+        doc.ifirma_id,
+        "PRZYJETA",
+        f"{nip}-{date.today():%Y%m%d}-{secrets.token_hex(6).upper()}-{secrets.token_hex(1).upper()}",
+    )
+    return _row(doc)
+
+
 @app.delete("/__mock/documents/{doc_id}")
 async def mock_delete_document(doc_id: str) -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
-    if not (doc_id.isdigit() and store.mark_deleted(int(doc_id))):
+    if not delete_document(doc_id):
         return JSONResponse({"detail": "Document not found"}, status_code=404)
     return JSONResponse({"deleted": int(doc_id)})
 
@@ -813,40 +842,40 @@ async def mock_delete_document(doc_id: str) -> JSONResponse:
 async def mock_ksef_accept(doc_id: str) -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
-    doc = store.get_active(int(doc_id)) if doc_id.isascii() and doc_id.isdigit() else None
-    if doc is None:
+    row = ksef_outcome(doc_id, True)
+    if row is None:
         return JSONResponse({"detail": "Document not found"}, status_code=404)
-    digits = "".join(ch for ch in str(doc.contractor_nip or "") if ch.isdigit())
-    nip = digits if len(digits) == 10 else "0000000000"
-    with store.lock():
-        doc.ksef_status = "PRZYJETA"
-        doc.ksef_number = (
-            f"{nip}-{date.today():%Y%m%d}-{secrets.token_hex(6).upper()}-{secrets.token_hex(1).upper()}"
-        )
-    return JSONResponse(_row(doc))
+    return JSONResponse(row)
 
 
 @app.post("/__mock/ksef/reject/{doc_id}")
 async def mock_ksef_reject(doc_id: str) -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
-    doc = store.get_active(int(doc_id)) if doc_id.isascii() and doc_id.isdigit() else None
-    if doc is None:
+    row = ksef_outcome(doc_id, False)
+    if row is None:
         return JSONResponse({"detail": "Document not found"}, status_code=404)
-    with store.lock():
-        doc.ksef_status = "ODRZUCONA"
-    return JSONResponse(_row(doc))
+    return JSONResponse(row)
 
 
 @app.post("/__mock/reset")
 async def mock_reset() -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
-    store.reset()
-    store.contractors_reset()
-    store.reset_test_switches()
-    reset_counters()
+    store.reset_all()
     return JSONResponse({"reset": True})
+
+
+def set_switch(name: str, value: Any) -> None:
+    """Apply an already validated value to one test switch (contractor-mode, pdf-not-ready, legacy-mode)."""
+    if name == "contractor-mode":
+        store.set_contractor_create_mode(value)
+    elif name == "pdf-not-ready":
+        store.set_pdf_not_ready(value)
+    elif name == "legacy-mode":
+        store.set_legacy_mode(value)
+    else:
+        raise ValueError(f"unknown switch {name!r}")
 
 
 @app.post("/__mock/contractor-mode")
@@ -857,7 +886,7 @@ async def mock_set_contractor_mode(request: Request) -> JSONResponse:
     mode = body.get("create") if isinstance(body, dict) else None
     if mode not in store.CONTRACTOR_CREATE_MODES:
         return JSONResponse({"detail": "create must be 'normal' or 'rename'"}, status_code=400)
-    store.set_contractor_create_mode(mode)
+    set_switch("contractor-mode", mode)
     return JSONResponse({"create": mode})
 
 
@@ -876,7 +905,7 @@ async def mock_set_pdf_not_ready(request: Request) -> JSONResponse:
     calls = body.get("calls") if isinstance(body, dict) else None
     if type(calls) is not int or calls < 0:
         return JSONResponse({"detail": "calls must be a non-negative integer"}, status_code=400)
-    store.set_pdf_not_ready(calls)
+    set_switch("pdf-not-ready", calls)
     return JSONResponse({"remaining": store.pdf_not_ready_remaining()})
 
 
@@ -895,7 +924,7 @@ async def mock_set_legacy_mode(request: Request) -> JSONResponse:
     enabled = body.get("enabled") if isinstance(body, dict) else None
     if type(enabled) is not bool:
         return JSONResponse({"detail": "enabled must be true or false"}, status_code=400)
-    store.set_legacy_mode(enabled)
+    set_switch("legacy-mode", enabled)
     return JSONResponse({"enabled": enabled})
 
 
@@ -904,3 +933,146 @@ async def mock_get_legacy_mode() -> JSONResponse:
     if (off := _test_endpoints_disabled()) is not None:
         return off
     return JSONResponse({"enabled": store.legacy_mode()})
+
+
+# --------------------------------------------------------------------------- #
+# Status page (HTML + JSON) and its form routes; no HMAC, never count as API calls #
+# --------------------------------------------------------------------------- #
+def status_data() -> dict[str, Any]:
+    """Everything the status page shows, as plain JSON-serialisable data."""
+    documents = []
+    for doc in sorted(store.all_documents(), key=lambda d: d.ifirma_id, reverse=True):
+        row = _row(doc)
+        row["deleted"] = doc.deleted
+        row["created_by"] = doc.created_by
+        row["statuses"] = sorted(doc.statuses())
+        documents.append(row)
+    return {
+        "service": "iFirma Mock API",
+        "version": app.version,
+        "settings": {
+            "user": settings.user,
+            "base_url": settings.base_url,
+            "strict_auth": settings.strict_auth,
+            "rate_limit": settings.rate_limit,
+            "strict_list_window": settings.strict_list_window,
+            "test_endpoints": settings.test_endpoints,
+        },
+        "persistence": state.info(),
+        "counters": {
+            "calls_total": store.calls_total(),
+            "calls_this_minute": store.calls_this_minute(),
+            "limit_granted": LIMIT_GRANTED,
+        },
+        "switches": {
+            "contractor_mode": store.contractor_create_mode(),
+            "pdf_not_ready_remaining": store.pdf_not_ready_remaining(),
+            "legacy_mode": store.legacy_mode(),
+        },
+        "documents": documents,
+        "contractors": store.all_contractors(),
+    }
+
+
+def _back(msg: str | None = None, error: str | None = None) -> RedirectResponse:
+    key, text = ("error", error) if error else ("msg", msg or "")
+    return RedirectResponse(f"/__mock/status?{key}={quote_plus(text)}", status_code=303)
+
+
+def _number(raw: str, blank: float | None) -> float | None:
+    text = raw.strip().replace(",", ".")
+    if not text:
+        return blank
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+@app.get("/__mock/status", response_model=None)
+async def mock_status_page(msg: str | None = None, error: str | None = None) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return HTMLResponse(ui.render_page(status_data(), msg, error))
+
+
+@app.get("/__mock/status.json")
+async def mock_status_json() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse(status_data())
+
+
+@app.post("/__mock/ui/seed", response_model=None)
+async def mock_ui_seed(request: Request) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    form = await ui.read_form(request)
+    doc_type = form.get("doc_type", "fakturaparagon")
+    if doc_type not in ("fakturaparagon", "fakturakraj"):
+        return _back(error="doc_type must be fakturaparagon or fakturakraj")
+    gross = _number(form.get("gross", ""), None)
+    if gross is None:
+        return _back(error="gross must be a number")
+    paid = _number(form.get("paid", ""), 0.0)
+    if paid is None:
+        return _back(error="paid must be a number")
+    contractor = {
+        key: form[field].strip()
+        for key, field in (("Nazwa", "name"), ("Identyfikator", "identifier"), ("NIP", "nip"), ("Email", "email"))
+        if form.get(field, "").strip()
+    }
+    row = seed_document({
+        "doc_type": doc_type, "contractor": contractor, "gross": gross, "paid": paid,
+        "created_by": "external",
+    })
+    return _back(msg=f"Seeded {row['PelnyNumer']} (id {row['FakturaId']}).")
+
+
+@app.post("/__mock/ui/switch/{name}", response_model=None)
+async def mock_ui_switch(name: str, request: Request) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    form = await ui.read_form(request)
+    raw = form.get("value", "").strip()
+    value: Any
+    if name == "contractor-mode":
+        if raw not in store.CONTRACTOR_CREATE_MODES:
+            return _back(error="contractor-mode must be normal or rename")
+        value = raw
+    elif name == "pdf-not-ready":
+        if not raw.isascii() or not raw.isdigit():
+            return _back(error="pdf-not-ready must be a non-negative integer")
+        value = int(raw)
+    elif name == "legacy-mode":
+        if raw.lower() not in ("true", "false"):
+            return _back(error="legacy-mode must be true or false")
+        value = raw.lower() == "true"
+    else:
+        return _back(error=f"Unknown switch {name}")
+    set_switch(name, value)
+    return _back(msg=f"{name} set to {raw.lower() if name == 'legacy-mode' else raw}.")
+
+
+@app.post("/__mock/ui/documents/{doc_id}/{action}", response_model=None)
+async def mock_ui_document(doc_id: str, action: str) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    if action == "delete":
+        done = delete_document(doc_id)
+        text = f"Deleted document {doc_id}."
+    elif action in ("ksef-accept", "ksef-reject"):
+        done = ksef_outcome(doc_id, action == "ksef-accept") is not None
+        text = f"Document {doc_id}: KSeF {'accepted' if action == 'ksef-accept' else 'rejected'}."
+    else:
+        return _back(error=f"Unknown action {action}")
+    return _back(msg=text) if done else _back(error=f"Document {doc_id} not found")
+
+
+@app.post("/__mock/ui/reset", response_model=None)
+async def mock_ui_reset() -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    store.reset_all()
+    return _back(msg="Mock state reset.")

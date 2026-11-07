@@ -2,17 +2,32 @@
 # Copyright (c) 2026 SCM Jakub Berechowski <admin@seccodesmith.pl>
 # See the LICENCE file in this directory for the full MIT terms.
 
-"""In-memory store of documents 'issued' by the mock (reset on restart)."""
+"""Single owner of the mock's mutable state (documents, contractors, switches, call counters).
+
+Every mutating function ends with ``_changed()`` while still holding the lock, which hands a
+plain-dict snapshot to the listener registered through ``on_change`` (none by default, so the
+mock stays memory-only until ``state.start`` registers the persistence listener).
+"""
 from __future__ import annotations
 
-import itertools
+import dataclasses
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Callable
 
 _lock = threading.Lock()
-_id_seq = itertools.count(1)
+_next_document_id = 1
+
+#: Listener called under the lock with a snapshot after every mutation (None = memory only).
+_listener: Callable[[dict[str, Any]], None] | None = None
+
+#: Authenticated-call accounting (feeds abonent/limit.json and the rate-limit simulation).
+#: The per-minute window is kept in memory only and is not part of the snapshot.
+_calls_total = 0
+_calls_minute: int | None = None
+_calls_minute_count = 0
 
 RODZAJ_MAP = {
     "fakturaparagon": "prz_faktura_paragon",
@@ -108,7 +123,7 @@ CONTRACTOR_BOOL_FIELDS = frozenset({
 CONTRACTOR_SEARCH_LIMIT = 20
 
 _contractors: dict[str, dict[str, Any]] = {}
-_contractor_seq = itertools.count(1)
+_next_contractor_seq = 1
 
 #: Test-only switches (see /__mock/contractor-mode, /__mock/pdf-not-ready and
 #: /__mock/legacy-mode). Guarded by _lock.
@@ -139,10 +154,18 @@ def _normalize_contractor(data: dict[str, Any], identifier: str) -> dict[str, An
     return out
 
 
+def _take_contractor_seq() -> int:
+    """Caller must hold _lock."""
+    global _next_contractor_seq
+    value = _next_contractor_seq
+    _next_contractor_seq += 1
+    return value
+
+
 def _new_contractor_identifier() -> str:
     """Caller must hold _lock."""
     while True:
-        candidate = "K%06d" % next(_contractor_seq)
+        candidate = "K%06d" % _take_contractor_seq()
         if candidate not in _contractors:
             return candidate
 
@@ -151,7 +174,7 @@ def _renamed_contractor_identifier(sent: str) -> str:
     """Caller must hold _lock. "IFI" + digits of the sent identifier + 6-digit sequence."""
     digits = "".join(ch for ch in sent if ch.isdigit())
     while True:
-        candidate = "IFI%s%06d" % (digits, next(_contractor_seq))
+        candidate = "IFI%s%06d" % (digits, _take_contractor_seq())
         if candidate not in _contractors:
             return candidate
 
@@ -179,6 +202,7 @@ def contractor_create(data: dict[str, Any]) -> dict[str, Any] | None:
             return None
         stored = _normalize_contractor(data, identifier)
         _contractors[identifier] = stored
+        _changed()
         return stored
 
 
@@ -190,6 +214,7 @@ def contractor_upsert(data: dict[str, Any]) -> dict[str, Any]:
             identifier = _new_contractor_identifier()
         stored = _normalize_contractor(data, identifier)
         _contractors[identifier] = stored
+        _changed()
         return stored
 
 
@@ -200,6 +225,7 @@ def contractor_update(identifier: str, data: dict[str, Any]) -> dict[str, Any] |
             return None
         stored = _normalize_contractor(data, identifier)
         _contractors[identifier] = stored
+        _changed()
         return stored
 
 
@@ -239,11 +265,18 @@ def contractor_search(phrase: str) -> list[dict[str, Any]]:
     return out
 
 
+def all_contractors() -> list[dict[str, Any]]:
+    """The stored contractors in insertion order."""
+    with _lock:
+        return list(_contractors.values())
+
+
 def contractors_reset() -> None:
-    global _contractor_seq
+    global _next_contractor_seq
     with _lock:
         _contractors.clear()
-        _contractor_seq = itertools.count(1)
+        _next_contractor_seq = 1
+        _changed()
 
 
 def set_contractor_create_mode(mode: str) -> None:
@@ -252,6 +285,7 @@ def set_contractor_create_mode(mode: str) -> None:
         raise ValueError(f"unknown contractor create mode: {mode!r}")
     with _lock:
         _contractor_create_mode = mode
+        _changed()
 
 
 def contractor_create_mode() -> str:
@@ -264,6 +298,7 @@ def set_pdf_not_ready(calls: int) -> None:
     global _pdf_not_ready_remaining
     with _lock:
         _pdf_not_ready_remaining = max(0, int(calls))
+        _changed()
 
 
 def pdf_not_ready_remaining() -> int:
@@ -278,6 +313,7 @@ def pdf_not_ready_consume() -> bool:
         if _pdf_not_ready_remaining <= 0:
             return False
         _pdf_not_ready_remaining -= 1
+        _changed()
         return True
 
 
@@ -285,6 +321,7 @@ def set_legacy_mode(enabled: bool) -> None:
     global _legacy_mode
     with _lock:
         _legacy_mode = bool(enabled)
+        _changed()
 
 
 def legacy_mode() -> bool:
@@ -299,6 +336,7 @@ def reset_test_switches() -> None:
         _contractor_create_mode = "normal"
         _pdf_not_ready_remaining = 0
         _legacy_mode = False
+        _changed()
 
 
 _documents: dict[int, Document] = {}
@@ -310,8 +348,10 @@ def create(doc_type: str, payload: dict[str, Any], **extra: Any) -> Document:
     `extra` may carry created_by, draft, currency, gross, linked_document,
     ksef_status and ksef_number.
     """
+    global _next_document_id
     with _lock:
-        new_id = next(_id_seq)
+        new_id = _next_document_id
+        _next_document_id += 1
         number = "%d/%d" % (new_id, date.today().year)
         contractor = payload.get("Kontrahent") or {}
         issue = str(payload.get("DataWystawienia") or date.today().isoformat())
@@ -343,6 +383,7 @@ def create(doc_type: str, payload: dict[str, Any], **extra: Any) -> Document:
             ksef_number=extra.get("ksef_number"),
         )
         _documents[new_id] = doc
+        _changed()
         return doc
 
 
@@ -363,6 +404,7 @@ def add_payment(ifirma_id: int, amount: float) -> Document | None:
         doc.payments.append({"Kwota": amount})
         doc.paid += amount
         doc.status = "paid"
+        _changed()
         return doc
 
 
@@ -372,6 +414,7 @@ def mark_deleted(ifirma_id: int) -> bool:
         if doc is None:
             return False
         doc.deleted = True
+        _changed()
         return True
 
 
@@ -380,10 +423,165 @@ def all_documents() -> list[Document]:
 
 
 def reset() -> None:
-    global _id_seq
+    global _next_document_id
     with _lock:
         _documents.clear()
-        _id_seq = itertools.count(1)
+        _next_document_id = 1
+        _changed()
+
+
+def set_ksef_status(doc_id: int, status: str | None, number: str | None = None) -> Document | None:
+    """Set the KSeF status (and, when given, the KSeF number) of a document; None when unknown."""
+    with _lock:
+        doc = _documents.get(doc_id)
+        if doc is None:
+            return None
+        doc.ksef_status = status
+        if number is not None:
+            doc.ksef_number = number
+        _changed()
+        return doc
+
+
+def mark_sent(doc_id: int, recipient: str | None) -> Document | None:
+    """Flag a document as e-mailed and remember the recipient; None when unknown."""
+    with _lock:
+        doc = _documents.get(doc_id)
+        if doc is None:
+            return None
+        doc.sent = True
+        if recipient:
+            doc.sent_to.append(str(recipient))
+        _changed()
+        return doc
+
+
+# --------------------------------------------------------------------------- #
+# Call accounting                                                              #
+# --------------------------------------------------------------------------- #
+def register_call() -> int:
+    """Count an authenticated call; return how many were counted in the current minute."""
+    global _calls_total, _calls_minute, _calls_minute_count
+    minute = int(time.time() // 60)
+    with _lock:
+        if _calls_minute != minute:
+            _calls_minute = minute
+            _calls_minute_count = 0
+        _calls_total += 1
+        _calls_minute_count += 1
+        count = _calls_minute_count
+        _changed()
+        return count
+
+
+def calls_total() -> int:
+    with _lock:
+        return _calls_total
+
+
+def calls_this_minute() -> int:
+    with _lock:
+        if _calls_minute != int(time.time() // 60):
+            return 0
+        return _calls_minute_count
+
+
+# --------------------------------------------------------------------------- #
+# Whole-state operations: reset, change listener, snapshot, restore            #
+# --------------------------------------------------------------------------- #
+def _clear_unlocked() -> None:
+    global _next_document_id, _next_contractor_seq, _calls_total, _calls_minute, _calls_minute_count
+    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode
+    _documents.clear()
+    _contractors.clear()
+    _next_document_id = 1
+    _next_contractor_seq = 1
+    _contractor_create_mode = "normal"
+    _pdf_not_ready_remaining = 0
+    _legacy_mode = False
+    _calls_total = 0
+    _calls_minute = None
+    _calls_minute_count = 0
+
+
+def reset_all() -> None:
+    """Clear documents, contractors, both sequences, the switches and the call counters."""
+    with _lock:
+        _clear_unlocked()
+        _changed()
+
+
+def on_change(callback: Callable[[dict[str, Any]], None] | None) -> None:
+    """Register the listener called (under the lock, with a snapshot) after every mutation."""
+    global _listener
+    with _lock:
+        _listener = callback
+
+
+def _changed() -> None:
+    """Caller must hold _lock."""
+    if _listener is not None:
+        _listener(_snapshot_unlocked())
+
+
+def _snapshot_unlocked() -> dict[str, Any]:
+    return {
+        "next_document_id": _next_document_id,
+        "next_contractor_seq": _next_contractor_seq,
+        "documents": [dataclasses.asdict(d) for d in _documents.values()],
+        "contractors": {k: dict(v) for k, v in _contractors.items()},
+        "switches": {
+            "contractor_create_mode": _contractor_create_mode,
+            "pdf_not_ready_remaining": _pdf_not_ready_remaining,
+            "legacy_mode": _legacy_mode,
+        },
+        "calls_total": _calls_total,
+    }
+
+
+def snapshot() -> dict[str, Any]:
+    """The whole mutable state as a plain, JSON-serialisable dict (rate-limit window excluded)."""
+    with _lock:
+        return _snapshot_unlocked()
+
+
+def restore(data: dict[str, Any]) -> None:
+    """Replace the state with a snapshot.
+
+    Missing document keys take the dataclass defaults and unknown ones are dropped, so an older
+    or newer file still loads. A document without ``ifirma_id`` is skipped.
+    """
+    global _next_document_id, _next_contractor_seq, _calls_total
+    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode
+    known = {f.name for f in dataclasses.fields(Document)}
+    documents: dict[int, Document] = {}
+    for raw in data.get("documents") or []:
+        kwargs = {k: v for k, v in raw.items() if k in known}
+        if "ifirma_id" not in kwargs:
+            continue
+        kwargs["ifirma_id"] = int(kwargs["ifirma_id"])
+        kwargs.setdefault("doc_type", "")
+        kwargs.setdefault("number", "")
+        kwargs.setdefault("payload", {})
+        documents[kwargs["ifirma_id"]] = Document(**kwargs)
+    contractors = {str(k): dict(v) for k, v in (data.get("contractors") or {}).items()}
+    switches = data.get("switches") or {}
+    mode = switches.get("contractor_create_mode", "normal")
+    next_doc = max(int(data.get("next_document_id") or 1), max(documents, default=0) + 1)
+    next_seq = max(int(data.get("next_contractor_seq") or 1), 1)
+    pdf_remaining = max(0, int(switches.get("pdf_not_ready_remaining") or 0))
+    calls = max(0, int(data.get("calls_total") or 0))
+    with _lock:
+        _clear_unlocked()
+        _documents.update(documents)
+        _contractors.update(contractors)
+        _next_document_id = next_doc
+        _next_contractor_seq = next_seq
+        _contractor_create_mode = mode if mode in CONTRACTOR_CREATE_MODES else "normal"
+        _pdf_not_ready_remaining = pdf_remaining
+        _legacy_mode = bool(switches.get("legacy_mode", False))
+        _calls_total = calls
+        _changed()
 
 
 def lock() -> threading.Lock:

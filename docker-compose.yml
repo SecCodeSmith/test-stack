@@ -41,6 +41,15 @@ services:
       IFIRMA_MOCK_RATE_LIMIT: ${IFIRMA_MOCK_RATE_LIMIT:-0}
       # Enables the /__mock/* seeding endpoints (set "false" to get HTTP 404).
       IFIRMA_MOCK_TEST_ENDPOINTS: ${IFIRMA_MOCK_TEST_ENDPOINTS:-true}
+      # Keeps documents, contractors, sequences, switches and the call counter across restarts
+      # (JSON file on the mock_data volume). Empty = memory only.
+      IFIRMA_MOCK_STATE_FILE: /data/ifirma-mock-state.json
+      # "true" starts the mock with an empty state (read at start-up only). The value is baked
+      # into the container until it is recreated: a plain "docker compose restart ifirma-mock"
+      # after an "up-clean" starts clean again; "make up" recreates the container without it.
+      IFIRMA_MOCK_CLEAN_START: ${IFIRMA_MOCK_CLEAN_START:-false}
+    volumes:
+      - mock_data:/data
     ports:
       - "8001:8001"
     networks: [ifirma]
@@ -83,6 +92,7 @@ services:
 volumes:
   db_data:
   ps_data:
+  mock_data:
 
 networks:
   ifirma:

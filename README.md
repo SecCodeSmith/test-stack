@@ -10,6 +10,8 @@ A self-contained test harness for the PrestaShop **`ifirma`** module. It lives a
 - **`docker-compose.yml`** — boots **PrestaShop (latest)** + **MariaDB** + the mock,
   with the module bind-mounted live into PrestaShop.
 
+The module repository's [architecture page](https://github.com/SecCodeSmith/prestashop-integration-with-iFirma/blob/master/docs/architecture.md) describes how the stack and the mock fit the module.
+
 ```
 test-stack/
 ├── docker-compose.yml
@@ -141,6 +143,55 @@ so the suite is both a functional test and an executable spec of the auth contra
   HTTP 401, like the real API. Set to `false` to accept anything (logs a warning) when
   you just want to smoke-test wiring.
 
+## State file and clean start
+
+The mock keeps its state in one JSON file: the documents, the contractors, the identifier
+sequences, the three test switches (see below) and the served-call counter. The per-minute
+rate-limit window is not kept, since it has no meaning after a restart. The state is written
+after every change to the JSON file named by `IFIRMA_MOCK_STATE_FILE`. In the stack that is
+`/data/ifirma-mock-state.json` on the named volume `mock_data`, so `docker compose up -d --build`,
+`docker compose restart` and a host reboot keep it, and `make destroy` removes it.
+
+When `IFIRMA_MOCK_STATE_FILE` is empty (the default outside the stack, as in the pytest suite
+and a plain `uvicorn` run) the mock keeps everything in memory only and starts empty each time.
+
+For a clean start, run `make up-clean` (or `IFIRMA_MOCK_CLEAN_START=true docker compose up -d --force-recreate ifirma-mock`).
+The variable is read at start-up only and discards the stored state first. It is baked into the
+container until that container is recreated: a plain `docker compose restart ifirma-mock` after an
+`up-clean` starts clean again, and `make up` recreates the container without the flag, so the
+state stored from then on is kept.
+
+`POST /__mock/reset` clears the state file as well as the memory, so a restart right after a
+reset starts empty.
+
+If the state file cannot be read (invalid JSON, or an unknown `version`), the mock renames it to
+`<file>.corrupt-<timestamp>`, starts empty and logs a warning, which shows in `make mock-logs`.
+The renamed file is kept, never deleted.
+
+## Status page
+
+Open <http://localhost:8001/__mock/status> to see the mock in a browser. It needs no HMAC
+signature, like the other `/__mock/*` routes. The page shows:
+
+- the effective settings (login, signed base URL, strict auth, rate limit, strict list window,
+  test endpoints) and the persistence state (state file path or "memory only", time of the last
+  write, whether the mock started clean);
+- the call counters: authenticated calls served in total and in the current minute, and the limit;
+- the three switches (contractor create mode, PDF-not-ready calls remaining, legacy mode), each
+  with a form that changes it;
+- the stored documents, newest first, with KSeF accept and reject and delete buttons per row;
+- the stored contractors.
+
+A form at the top seeds a sample document (document type, contractor, gross and paid amount) through
+the same rules as `POST /__mock/documents`. A reset button does what `POST /__mock/reset` does, after
+a confirmation. Each action returns to the page with a message.
+
+`GET /__mock/status.json` returns the same data as JSON for scripts. The page, its JSON twin and its
+actions are test-only: with `IFIRMA_MOCK_TEST_ENDPOINTS=false` they answer HTTP 404. None of them counts
+as an API call, so watching the page never changes the call counter or the simulated rate limit.
+
+![Mock status page](docs/img/mock-status.png)
+
 ## Simulating iFirma's own integrator
 
 iFirma's own integrations (shop plugins, marketplaces) create documents the module
@@ -158,7 +209,7 @@ curl -X POST http://localhost:8001/__mock/documents -H 'Content-Type: applicatio
 # delete it again (disappears from lists and detail)
 curl -X DELETE http://localhost:8001/__mock/documents/1
 
-# wipe all documents, contractors, call counters and the two switches below
+# wipe all documents, contractors, call counters and the three switches below, and clear the stored state file
 curl -X POST http://localhost:8001/__mock/reset
 ```
 
@@ -219,6 +270,8 @@ defaults to `issue_date` (or today if that is absent too); `sale_date_format` de
 | `IFIRMA_MOCK_TEST_ENDPOINTS` | `true` | Enables `/__mock/*`; when `false` they return HTTP 404 |
 | `IFIRMA_MOCK_STRICT_LIST_WINDOW` | `false` | When `true`, `faktury.json` without `dataDo` uses the real API's `dataOd + 30 days` window (off by default so a plain `dataOd=2020-01-01` call still lists new documents) |
 | `IFIRMA_MOCK_KEY_ABONENT` | empty | Key for `abonent/limit.json`; empty means that endpoint always answers 401 |
+| `IFIRMA_MOCK_STATE_FILE` | empty (memory only) | Path of the JSON file that keeps the mock state across restarts; the compose file sets `/data/ifirma-mock-state.json` on the `mock_data` volume |
+| `IFIRMA_MOCK_CLEAN_START` | `false` | When `true`, the mock starts with an empty state and discards the stored one (read at start-up only; see "State file and clean start") |
 
 ## Notes
 

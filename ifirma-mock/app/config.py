@@ -48,5 +48,11 @@ class Settings:
     #: original "dataOd=2020-01-01" smoke call still lists freshly created documents.
     strict_list_window: bool = _env_bool("IFIRMA_MOCK_STRICT_LIST_WINDOW", False)
 
+    #: File the mock keeps its state in across restarts (empty = memory only, nothing is written).
+    state_file: str = os.getenv("IFIRMA_MOCK_STATE_FILE", "").strip()
+
+    #: Discard the stored state at start-up (read at start-up only).
+    clean_start: bool = _env_bool("IFIRMA_MOCK_CLEAN_START", False)
+
 
 settings = Settings()
