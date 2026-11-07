@@ -164,6 +164,33 @@ def _contractors(items: list[dict[str, Any]]) -> str:
     return f"<table>{head}{rows}</table>"
 
 
+def _mail(items: list[dict[str, Any]], port: int, reject: bool) -> str:
+    port_line = f"<p>SMTP listener on port {_e(port)}</p>" if port else "<p>SMTP listener off</p>"
+    current = "true" if reject else "false"
+    options = "".join(
+        f'<option value="{v}"{" selected" if v == current else ""}>{v}</option>' for v in ("true", "false")
+    )
+    form = _switch_form("mail-reject", "Reject mail (answer DATA with 554)", current,
+                        f'<label>value <select name="value">{options}</select></label>')
+    if not items:
+        table = "<p>The mailbox is empty.</p>"
+    else:
+        head = ("<tr><th>Received</th><th>From</th><th>To</th><th>Bcc</th><th>Subject</th>"
+                "<th>Attachments</th><th>Raw</th></tr>")
+        rows = "".join(
+            f"<tr><td>{_e(m['received_at'])}</td><td>{_e(m['from'])}</td><td>{_e(', '.join(m['to']))}</td>"
+            f"<td>{_e(', '.join(m['bcc']))}</td><td>{_e(m['subject'])}</td><td>{_e(m['attachments'])}</td>"
+            f'<td><a href="/__mock/mail/{_e(m["id"])}/raw">raw</a></td></tr>'
+            for m in items
+        )
+        table = f"<table>{head}{rows}</table>"
+    clear = (
+        '<form method="post" action="/__mock/ui/mail/clear">'
+        '<button type="submit">Clear mailbox</button></form>'
+    )
+    return port_line + form + table + clear
+
+
 def render_page(data: dict[str, Any], msg: str | None = None, error: str | None = None) -> str:
     s = data["settings"]
     c = data["counters"]
@@ -194,7 +221,9 @@ def render_page(data: dict[str, Any], msg: str | None = None, error: str | None 
         + "<h2>Seed</h2>" + _seed_form()
         + "<h2>Documents</h2>" + _documents(data["documents"])
         + "<h2>Contractors</h2>" + _contractors(data["contractors"])
+        + "<h2>Mail</h2>" + _mail(data["mail"], s["smtp_port"], data["switches"]["mail_reject"])
         + "<h2>Reset</h2>"
+        "<p>Resets documents, contractors, switches, counters, the stored state, the mailbox and the mail reject switch.</p>"
         '<form method="post" action="/__mock/ui/reset">'
         '<button type="submit" onclick="return confirm(\'Reset all mock state?\')">Reset everything</button></form>'
     )

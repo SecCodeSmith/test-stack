@@ -1,6 +1,6 @@
 [project]
 name = "ifirma-mock"
-version = "1.1.0"
+version = "1.2.0"
 description = "Mock of the iFirma API for testing the PrestaShop ifirma module"
 requires-python = ">=3.10"
 

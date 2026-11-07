@@ -4,7 +4,7 @@ A self-contained test harness for the PrestaShop **`ifirma`** module. It lives a
 <https://github.com/SecCodeSmith/test-stack> and is consumed by the iFirma module repo as the
 `test-stack` git submodule (clone the module with `--recurse-submodules`) and provides:
 
-- **`ifirma-mock/`** — a **FastAPI** service that mocks the iFirma API. It implements
+- **`ifirma-mock/`** — a **FastAPI** service that mocks the iFirma API and an SMTP sink. It implements
   the exact endpoints the module calls **and validates the module's HMAC-SHA1
   signature**, so signing bugs surface immediately.
 - **`docker-compose.yml`** — boots **PrestaShop (latest)** + **MariaDB** + the mock,
@@ -90,6 +90,7 @@ docker compose up -d --build  # or: make up
 - PrestaShop back office → http://localhost:8080/admin-dev  (`admin@example.com` / `Passw0rd!`)
 - PrestaShop front office → http://localhost:8080
 - iFirma mock → http://localhost:8001  (docs at http://localhost:8001/docs)
+- SMTP sink → localhost:1025 (messages at http://localhost:8001/__mock/mail)
 
 First PrestaShop boot takes a few minutes while it auto-installs. Follow it with
 `make ps-logs`.
@@ -190,7 +191,68 @@ a confirmation. Each action returns to the page with a message.
 actions are test-only: with `IFIRMA_MOCK_TEST_ENDPOINTS=false` they answer HTTP 404. None of them counts
 as an API call, so watching the page never changes the call counter or the simulated rate limit.
 
+The page also has a Mail section: the SMTP port, a form that switches the reject mode on or off, the
+messages newest first (time, from, to, bcc, subject, attachments, a link to the raw source) and a
+"Clear mailbox" button. `/__mock/status.json` carries the same data as `mail`, `switches.mail_reject`
+and `settings.smtp_port`.
+
 ![Mock status page](docs/img/mock-status.png)
+
+## Mail sink (SMTP)
+
+The mock also runs an SMTP listener on port 1025 inside its container. It accepts any sender and any
+recipient, with no `AUTH` and no TLS, and answers every message with 250. Messages are kept in memory
+only, up to 200 (the oldest is dropped first). The mailbox is empty after a restart and `POST /__mock/reset`
+empties it. Nothing is relayed to a real mailbox.
+
+Point a PrestaShop shop at the sink:
+
+| PrestaShop setting | Value |
+|--------------------|-------|
+| `PS_MAIL_METHOD` | `2` (SMTP) |
+| `PS_MAIL_SERVER` | `ifirma-mock` |
+| `PS_MAIL_SMTP_PORT` | `1025` |
+| `PS_MAIL_SMTP_ENCRYPTION` | `off` |
+| `PS_MAIL_USER` | empty |
+| `PS_MAIL_PASSWD` | empty |
+| `PS_MAIL_TYPE` | `3` (HTML plus text) |
+
+The module's `tests/smoke/run.php` writes these settings itself before it runs, so the shops it tests send their mail here.
+
+Read the mailbox back with these endpoints:
+
+| Method and path | Answer |
+|-----------------|--------|
+| `GET /__mock/mail` | Listing, newest first: `id`, `received_at`, `from`, `to`, `cc`, `bcc`, `subject`, attachments count, `size`. `bcc` holds the envelope recipients that are in neither `To` nor `Cc`. |
+| `GET /__mock/mail/{id}` | One message: the listing fields plus `headers`, `text`, `html`, `envelope`, `attachments` (`filename`, `content_type`, `size`, `sha256`) and `inline` (embedded images such as the shop logo, listed separately from attachments; adds `content_id`). |
+| `GET /__mock/mail/{id}/raw` | The raw message as `message/rfc822`. |
+| `GET /__mock/mail/{id}/attachments/{index}` | The bytes of one attachment, with its content type. |
+| `GET /__mock/mail/{id}/inline/{index}` | The bytes of one embedded (inline) image, with its content type. |
+| `DELETE /__mock/mail` | Empties the mailbox. |
+| `GET /__mock/mail/reject` | The reject switch: `{"enabled": bool}`. |
+| `POST /__mock/mail/reject` | Body `{"enabled": true}` turns the switch on (or `false` off). While on, the listener answers 554 at `DATA` and stores nothing, so the shop records a failed delivery. |
+
+All of these are test endpoints: they answer 404 when `IFIRMA_MOCK_TEST_ENDPOINTS=false`, and none of
+them counts as an API call.
+
+### Shop mail lands in the sink
+
+Send a test message from the host, then read the mailbox:
+
+```python
+import smtplib
+from email.message import EmailMessage
+
+msg = EmailMessage()
+msg["From"], msg["To"], msg["Subject"] = "shop@example.test", "customer@example.test", "Test"
+msg.set_content("Hello from the host.")
+with smtplib.SMTP("localhost", 1025) as smtp:
+    smtp.send_message(msg)
+```
+
+```bash
+curl http://localhost:8001/__mock/mail
+```
 
 ## Simulating iFirma's own integrator
 
@@ -272,6 +334,7 @@ defaults to `issue_date` (or today if that is absent too); `sale_date_format` de
 | `IFIRMA_MOCK_KEY_ABONENT` | empty | Key for `abonent/limit.json`; empty means that endpoint always answers 401 |
 | `IFIRMA_MOCK_STATE_FILE` | empty (memory only) | Path of the JSON file that keeps the mock state across restarts; the compose file sets `/data/ifirma-mock-state.json` on the `mock_data` volume |
 | `IFIRMA_MOCK_CLEAN_START` | `false` | When `true`, the mock starts with an empty state and discards the stored one (read at start-up only; see "State file and clean start") |
+| `IFIRMA_MOCK_SMTP_PORT` | `1025` | Port of the SMTP sink inside the mock; `0` disables the listener (see "Mail sink (SMTP)") |
 
 ## Notes
 

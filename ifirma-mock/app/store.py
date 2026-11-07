@@ -10,6 +10,7 @@ mock stays memory-only until ``state.start`` registers the persistence listener)
 """
 from __future__ import annotations
 
+import collections
 import dataclasses
 import threading
 import time
@@ -330,12 +331,13 @@ def legacy_mode() -> bool:
 
 
 def reset_test_switches() -> None:
-    """Restore normal contractor creation, clear the PDF-not-ready counter and legacy mode."""
-    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode
+    """Restore normal contractor creation, clear the PDF-not-ready counter, legacy mode and the mail reject switch."""
+    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode, _mail_reject
     with _lock:
         _contractor_create_mode = "normal"
         _pdf_not_ready_remaining = 0
         _legacy_mode = False
+        _mail_reject = False
         _changed()
 
 
@@ -487,11 +489,74 @@ def calls_this_minute() -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Mailbox (SMTP sink). Memory only: never part of snapshot()/restore(), so none of these   #
+# functions calls _changed().                                                          #
+# --------------------------------------------------------------------------- #
+MAIL_LIMIT = 200
+
+_mail: collections.deque[dict[str, Any]] = collections.deque(maxlen=MAIL_LIMIT)
+_next_mail_id = 1
+_mail_reject = False
+
+
+def _clear_mail_unlocked() -> None:
+    """Caller must hold _lock (or be the only user). Empties the mailbox and the reject switch."""
+    global _next_mail_id, _mail_reject
+    _mail.clear()
+    _next_mail_id = 1
+    _mail_reject = False
+
+
+def mail_add(record: dict[str, Any]) -> int:
+    """Store a received message (oldest dropped beyond MAIL_LIMIT); returns its new id."""
+    global _next_mail_id
+    with _lock:
+        mail_id = _next_mail_id
+        _next_mail_id += 1
+        _mail.append({**record, "id": mail_id})
+        return mail_id
+
+
+def mail_all() -> list[dict[str, Any]]:
+    """Stored messages, newest first."""
+    with _lock:
+        return list(reversed(_mail))
+
+
+def mail_get(mail_id: int) -> dict[str, Any] | None:
+    with _lock:
+        for record in _mail:
+            if record["id"] == mail_id:
+                return record
+    return None
+
+
+def mail_clear() -> None:
+    """Empty the mailbox; ids keep counting up."""
+    with _lock:
+        _mail.clear()
+
+
+def set_mail_reject(enabled: bool) -> None:
+    global _mail_reject
+    with _lock:
+        _mail_reject = bool(enabled)
+
+
+def mail_reject() -> bool:
+    with _lock:
+        return _mail_reject
+
+
+# --------------------------------------------------------------------------- #
 # Whole-state operations: reset, change listener, snapshot, restore            #
 # --------------------------------------------------------------------------- #
-def _clear_unlocked() -> None:
+def _clear_unlocked(keep_mail: bool = False) -> None:
+    """Empty everything; `restore()` passes keep_mail=True (the mailbox is not part of a snapshot)."""
     global _next_document_id, _next_contractor_seq, _calls_total, _calls_minute, _calls_minute_count
     global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode
+    if not keep_mail:
+        _clear_mail_unlocked()
     _documents.clear()
     _contractors.clear()
     _next_document_id = 1
@@ -572,7 +637,7 @@ def restore(data: dict[str, Any]) -> None:
     pdf_remaining = max(0, int(switches.get("pdf_not_ready_remaining") or 0))
     calls = max(0, int(data.get("calls_total") or 0))
     with _lock:
-        _clear_unlocked()
+        _clear_unlocked(keep_mail=True)
         _documents.update(documents)
         _contractors.update(contractors)
         _next_document_id = next_doc

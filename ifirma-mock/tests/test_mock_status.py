@@ -283,12 +283,13 @@ def test_script_reads_the_state():
     seed()
     data = client.get("/__mock/status.json").json()
     assert set(data) == {"service", "version", "settings", "persistence", "counters", "switches",
-                         "documents", "contractors"}
+                         "documents", "contractors", "mail"}
     assert data["version"] == app.version
     assert set(data["settings"]) == {"user", "base_url", "strict_auth", "rate_limit",
-                                     "strict_list_window", "test_endpoints"}
+                                     "strict_list_window", "test_endpoints", "smtp_port"}
     assert set(data["counters"]) == {"calls_total", "calls_this_minute", "limit_granted"}
-    assert set(data["switches"]) == {"contractor_mode", "pdf_not_ready_remaining", "legacy_mode"}
+    assert set(data["switches"]) == {"contractor_mode", "pdf_not_ready_remaining", "legacy_mode",
+                                    "mail_reject"}
     assert set(data["persistence"]) == {"mode", "path", "last_write", "clean_start", "loaded_from_file"}
     doc = data["documents"][0]
     assert {"deleted", "created_by", "statuses", "KsefStatus", "PelnyNumer"} <= set(doc)
@@ -311,3 +312,108 @@ def test_watching_the_page_while_testing(monkeypatch):
     assert resp.json()["response"]["Kod"] == 0
     assert resp.json()["response"]["LimitWykorzystany"] == 2
     assert store.calls_total() == 2
+
+
+# --------------------------------------------------------------------------- #
+# Requirement: Page shows the mailbox (SMTP sink)                              #
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def sink():
+    from app import smtp
+    bound = smtp.start(0, host="127.0.0.1")
+    yield bound
+    smtp.stop()
+
+
+def send_mail(port: int, subject: str = "Hello", rcpts=None, with_pdf: bool = False) -> None:
+    import smtplib
+    from email.message import EmailMessage
+    from email.policy import SMTP
+
+    msg = EmailMessage()
+    msg["From"] = "shop@example.test"
+    msg["To"] = "customer@example.test"
+    msg["Subject"] = subject
+    msg.set_content("body")
+    if with_pdf:
+        msg.add_attachment(b"%PDF-1.4 test", maintype="application", subtype="pdf", filename="a.pdf")
+    with smtplib.SMTP("127.0.0.1", port, local_hostname="localhost") as conn:
+        conn.sendmail("shop@example.test", rcpts or ["customer@example.test"], msg.as_bytes(policy=SMTP))
+
+
+def test_empty_mailbox(monkeypatch):
+    monkeypatch.setattr(settings, "smtp_port", 1025)
+    html = page()
+    assert "The mailbox is empty." in html
+    assert "SMTP listener on port 1025" in html
+    assert "/__mock/ui/switch/mail-reject" in html
+    assert "Current: <strong>false</strong>" in html.split("Reject mail")[1]
+
+
+def test_smtp_listener_off(monkeypatch):
+    monkeypatch.setattr(settings, "smtp_port", 0)
+    assert "SMTP listener off" in page()
+
+
+def test_messages_listed(sink):
+    send_mail(sink, subject="First message")
+    send_mail(sink, subject="Second message", rcpts=["customer@example.test", "blind@example.test"],
+              with_pdf=True)
+    html = page()
+    assert "The mailbox is empty." not in html
+    assert html.index("Second message") < html.index("First message")
+    row = next(r for r in html.split("<tr>") if "Second message" in r)
+    assert "customer@example.test" in row and "blind@example.test" in row
+    assert "<td>1</td>" in row
+    newest = client.get("/__mock/mail").json()["mail"][0]["id"]
+    assert f'href="/__mock/mail/{newest}/raw"' in html
+
+
+def test_reject_switched_from_the_page():
+    assert redirect(post("/__mock/ui/switch/mail-reject", value="true"))["msg"]
+    assert client.get("/__mock/mail/reject").json() == {"enabled": True}
+    assert "Current: <strong>true</strong>" in page().split("Reject mail")[1]
+    assert redirect(post("/__mock/ui/switch/mail-reject", value="false"))["msg"]
+    assert client.get("/__mock/mail/reject").json() == {"enabled": False}
+    assert "error" in redirect(post("/__mock/ui/switch/mail-reject", value="maybe"))
+
+
+def test_mailbox_cleared_from_the_page(sink):
+    send_mail(sink)
+    assert redirect(post("/__mock/ui/mail/clear")) == {"msg": "Mailbox cleared"}
+    assert "The mailbox is empty." in page()
+    assert client.get("/__mock/mail").json() == {"mail": []}
+
+
+def test_subject_is_escaped(sink):
+    send_mail(sink, subject="<img src=x onerror=alert(1)>")
+    html = page()
+    assert "<img" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+
+
+def test_reset_clicked_also_clears_mail(sink):
+    send_mail(sink)
+    client.post("/__mock/mail/reject", json={"enabled": True})
+    assert redirect(post("/__mock/ui/reset"))["msg"]
+    data = client.get("/__mock/status.json").json()
+    assert data["mail"] == [] and data["switches"]["mail_reject"] is False
+    assert "The mailbox is empty." in page()
+
+
+def test_script_reads_the_mailbox(sink, monkeypatch):
+    monkeypatch.setattr(settings, "smtp_port", sink)
+    send_mail(sink, subject="For scripts")
+    data = client.get("/__mock/status.json").json()
+    assert len(data["mail"]) == 1
+    assert data["mail"][0] == client.get("/__mock/mail").json()["mail"][0]
+    assert data["mail"][0]["subject"] == "For scripts"
+    assert data["switches"]["mail_reject"] is False
+    assert data["settings"]["smtp_port"] == sink
+
+
+def test_mail_form_routes_are_404_when_test_endpoints_are_off(monkeypatch):
+    monkeypatch.setattr(settings, "test_endpoints", False)
+    assert post("/__mock/ui/mail/clear").status_code == 404
+    assert post("/__mock/ui/switch/mail-reject", value="true").status_code == 404
+    assert store.mail_reject() is False

@@ -27,8 +27,10 @@ Test-only helpers (no HMAC, guarded by IFIRMA_MOCK_TEST_ENDPOINTS):
   POST /__mock/ksef/accept/{id}, POST /__mock/ksef/reject/{id}, POST /__mock/reset,
   POST|GET /__mock/contractor-mode (create: normal|rename), POST|GET /__mock/pdf-not-ready,
   POST|GET /__mock/legacy-mode (enabled: true|false),
+  GET /__mock/mail, GET /__mock/mail/{id}[/raw|/attachments/{n}], DELETE /__mock/mail and
+  POST|GET /__mock/mail/reject (enabled: true|false) for the SMTP sink (see smtp.py),
   GET /__mock/status (HTML status page), GET /__mock/status.json, and the page's form
-  routes POST /__mock/ui/{seed|switch/{name}|documents/{id}/{action}|reset} (303 back to the page)
+  routes POST /__mock/ui/{seed|switch/{name}|documents/{id}/{action}|mail/clear|reset} (303 back to the page)
 
 State: kept in memory, and in the JSON file IFIRMA_MOCK_STATE_FILE when set (see state.py);
 IFIRMA_MOCK_CLEAN_START=true discards that file at start-up.
@@ -44,12 +46,12 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from . import state, store, ui
+from . import smtp, state, store, ui
 from .auth import verify
 from .config import settings
 from .pdf import build_pdf
@@ -58,10 +60,21 @@ from .pdf import build_pdf
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     state.start(settings)
-    yield
+    started = False
+    if settings.smtp_port:
+        try:
+            smtp.start(settings.smtp_port)
+            started = True
+        except OSError as exc:  # the HTTP mock stays usable without its mail sink
+            state.logger.error("SMTP sink could not listen on port %s: %s", settings.smtp_port, exc)
+    try:
+        yield
+    finally:
+        if started:
+            smtp.stop()
 
 
-app = FastAPI(title="iFirma Mock API", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="iFirma Mock API", version="1.2.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -127,6 +140,8 @@ async def root() -> dict[str, Any]:
         "strict_auth": settings.strict_auth,
         "documents_issued": len(store.all_documents()),
         "status_page": "/__mock/status",
+        "smtp_port": settings.smtp_port,
+        "mailbox": "/__mock/mail",
     }
 
 
@@ -867,13 +882,15 @@ async def mock_reset() -> JSONResponse:
 
 
 def set_switch(name: str, value: Any) -> None:
-    """Apply an already validated value to one test switch (contractor-mode, pdf-not-ready, legacy-mode)."""
+    """Apply an already validated value to one test switch (contractor-mode, pdf-not-ready, legacy-mode, mail-reject)."""
     if name == "contractor-mode":
         store.set_contractor_create_mode(value)
     elif name == "pdf-not-ready":
         store.set_pdf_not_ready(value)
     elif name == "legacy-mode":
         store.set_legacy_mode(value)
+    elif name == "mail-reject":
+        store.set_mail_reject(value)
     else:
         raise ValueError(f"unknown switch {name!r}")
 
@@ -936,6 +953,94 @@ async def mock_get_legacy_mode() -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Mailbox of the SMTP sink (test endpoints; never count as API calls)          #
+# --------------------------------------------------------------------------- #
+@app.get("/__mock/mail")
+async def mock_mail_list() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse({"mail": [smtp.listing(r) for r in store.mail_all()]})
+
+
+@app.delete("/__mock/mail")
+async def mock_mail_clear() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    store.mail_clear()
+    return JSONResponse({"cleared": True})
+
+
+# Declared before /__mock/mail/{mail_id} so that "reject" is never read as an id.
+@app.post("/__mock/mail/reject")
+async def mock_set_mail_reject(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if type(enabled) is not bool:
+        return JSONResponse({"detail": "enabled must be true or false"}, status_code=422)
+    set_switch("mail-reject", enabled)
+    return JSONResponse({"enabled": enabled})
+
+
+@app.get("/__mock/mail/reject")
+async def mock_get_mail_reject() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse({"enabled": store.mail_reject()})
+
+
+def _mail_not_found() -> JSONResponse:
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+
+@app.get("/__mock/mail/{mail_id}")
+async def mock_mail_get(mail_id: int) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    record = store.mail_get(mail_id)
+    if record is None:
+        return _mail_not_found()
+    return JSONResponse(smtp.public(record))
+
+
+@app.get("/__mock/mail/{mail_id}/raw", response_model=None)
+async def mock_mail_raw(mail_id: int) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    record = store.mail_get(mail_id)
+    if record is None:
+        return _mail_not_found()
+    return Response(record["_raw"], media_type="message/rfc822")
+
+
+@app.get("/__mock/mail/{mail_id}/inline/{index}", response_model=None)
+async def mock_mail_inline(mail_id: int, index: int) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    record = store.mail_get(mail_id)
+    if record is None or not 0 <= index < len(record["inline"]):
+        return _mail_not_found()
+    return Response(record["_inline_bytes"][index], media_type=record["inline"][index]["content_type"])
+
+
+@app.get("/__mock/mail/{mail_id}/attachments/{index}", response_model=None)
+async def mock_mail_attachment(mail_id: int, index: int) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    record = store.mail_get(mail_id)
+    if record is None or not 0 <= index < len(record["attachments"]):
+        return _mail_not_found()
+    meta = record["attachments"][index]
+    filename = quote(meta["filename"] or f"attachment-{index}", safe="")
+    return Response(
+        record["_attachment_bytes"][index],
+        media_type=meta["content_type"],
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Status page (HTML + JSON) and its form routes; no HMAC, never count as API calls #
 # --------------------------------------------------------------------------- #
 def status_data() -> dict[str, Any]:
@@ -957,6 +1062,7 @@ def status_data() -> dict[str, Any]:
             "rate_limit": settings.rate_limit,
             "strict_list_window": settings.strict_list_window,
             "test_endpoints": settings.test_endpoints,
+            "smtp_port": settings.smtp_port,
         },
         "persistence": state.info(),
         "counters": {
@@ -968,9 +1074,11 @@ def status_data() -> dict[str, Any]:
             "contractor_mode": store.contractor_create_mode(),
             "pdf_not_ready_remaining": store.pdf_not_ready_remaining(),
             "legacy_mode": store.legacy_mode(),
+            "mail_reject": store.mail_reject(),
         },
         "documents": documents,
         "contractors": store.all_contractors(),
+        "mail": [smtp.listing(r) for r in store.mail_all()],
     }
 
 
@@ -1049,10 +1157,14 @@ async def mock_ui_switch(name: str, request: Request) -> Response:
         if raw.lower() not in ("true", "false"):
             return _back(error="legacy-mode must be true or false")
         value = raw.lower() == "true"
+    elif name == "mail-reject":
+        if raw.lower() not in ("true", "false"):
+            return _back(error="mail-reject must be true or false")
+        value = raw.lower() == "true"
     else:
         return _back(error=f"Unknown switch {name}")
     set_switch(name, value)
-    return _back(msg=f"{name} set to {raw.lower() if name == 'legacy-mode' else raw}.")
+    return _back(msg=f"{name} set to {raw.lower() if name in ('legacy-mode', 'mail-reject') else raw}.")
 
 
 @app.post("/__mock/ui/documents/{doc_id}/{action}", response_model=None)
@@ -1068,6 +1180,14 @@ async def mock_ui_document(doc_id: str, action: str) -> Response:
     else:
         return _back(error=f"Unknown action {action}")
     return _back(msg=text) if done else _back(error=f"Document {doc_id} not found")
+
+
+@app.post("/__mock/ui/mail/clear", response_model=None)
+async def mock_ui_mail_clear() -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    store.mail_clear()
+    return _back(msg="Mailbox cleared")
 
 
 @app.post("/__mock/ui/reset", response_model=None)

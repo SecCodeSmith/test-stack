@@ -54,5 +54,8 @@ class Settings:
     #: Discard the stored state at start-up (read at start-up only).
     clean_start: bool = _env_bool("IFIRMA_MOCK_CLEAN_START", False)
 
+    #: Port of the SMTP sink that catches the shop's e-mails (0 = no listener).
+    smtp_port: int = int(os.getenv("IFIRMA_MOCK_SMTP_PORT", "1025") or 0)
+
 
 settings = Settings()
