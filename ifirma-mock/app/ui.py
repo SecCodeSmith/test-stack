@@ -134,7 +134,7 @@ def _documents(docs: list[dict[str, Any]]) -> str:
     if not docs:
         return "<p>No documents stored.</p>"
     head = ("<tr><th>Id</th><th>Number</th><th>Type</th><th>Contractor</th><th>NIP</th><th>Issued</th>"
-            "<th>Due</th><th>Gross</th><th>Paid</th><th>Buckets</th><th>KSeF</th><th>Created by</th>"
+            "<th>Due</th><th>Gross</th><th>Paid</th><th>Template</th><th>Buckets</th><th>KSeF</th><th>Created by</th>"
             "<th>Sent</th><th>Actions</th></tr>")
     rows = []
     for d in docs:
@@ -145,7 +145,7 @@ def _documents(docs: list[dict[str, Any]]) -> str:
             f"<td>{_e(d['FakturaId'])}{marker}</td><td>{_e(d['PelnyNumer'])}</td><td>{_e(d['Rodzaj'])}</td>"
             f"<td>{_e(d['KontrahentNazwa'])}</td><td>{_e(d['NIPKontrahenta'])}</td>"
             f"<td>{_e(d['DataWystawienia'])}</td><td>{_e(d['TerminPlatnosci'])}</td>"
-            f"<td>{d['Brutto']:.2f}</td><td>{d['Zaplacono']:.2f}</td>"
+            f"<td>{d['Brutto']:.2f}</td><td>{d['Zaplacono']:.2f}</td><td>{_e(d.get('NazwaSzablonu', ''))}</td>"
             f"<td>{_e(', '.join(d['statuses']))}</td><td>{_e(ksef)}</td><td>{_e(d['created_by'])}</td>"
             f"<td>{_e(d['CzyWyslano'])}</td><td>{_doc_buttons(d)}</td></tr>"
         )

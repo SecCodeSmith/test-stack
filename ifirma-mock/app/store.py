@@ -70,6 +70,7 @@ class Document:
     due_date: str = ""
     uwagi: str = ""
     dodatkowe_uwagi: Any = None
+    nazwa_szablonu: str = ""
     sent_to: list[str] = field(default_factory=list)
     sent: bool = False
     deleted: bool = False
@@ -373,6 +374,7 @@ def create(doc_type: str, payload: dict[str, Any], **extra: Any) -> Document:
             due_date=str(due),
             uwagi=str(payload.get("Uwagi") or ""),
             dodatkowe_uwagi=payload.get("DodatkoweUwagi"),
+            nazwa_szablonu=str(payload.get("NazwaSzablonu") or ""),
             draft=bool(extra.get("draft", False)),
             currency=str(extra.get("currency") or payload.get("Waluta") or "PLN"),
             gross=round(float(gross), 2) if gross is not None else compute_gross(payload),

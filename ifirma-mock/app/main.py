@@ -74,7 +74,7 @@ async def lifespan(_app: FastAPI):
             smtp.stop()
 
 
-app = FastAPI(title="iFirma Mock API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="iFirma Mock API", version="1.3.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -414,7 +414,7 @@ VALID_STATUSES = {"oplacone", "nieoplacone", "oplaconeCzesciowo", "przeterminowa
 
 def _row(d: store.Document) -> dict[str, Any]:
     # Exact key order of the official faktury.json row.
-    return {
+    row = {
         "KontrahentNazwa": d.contractor_name,
         "IdentyfikatorKontrahenta": d.contractor_id,
         "NIPKontrahenta": d.contractor_nip,
@@ -433,6 +433,10 @@ def _row(d: store.Document) -> dict[str, Any]:
         "KsefNumer": d.ksef_number,
         "KsefStatus": d.ksef_status,
     }
+    if d.nazwa_szablonu:
+        # Only a document created with a template carries the extra key, so the official row stays as is.
+        row["NazwaSzablonu"] = d.nazwa_szablonu
+    return row
 
 
 def _int_param(request: Request, name: str, default: int) -> int:
@@ -641,6 +645,8 @@ async def document_detail(doc_type: str, doc_id: str, request: Request) -> JSONR
     node["Zaplacono"] = round(doc.paid, 2)
     node["Uwagi"] = doc.uwagi
     node["DodatkoweUwagi"] = doc.dodatkowe_uwagi
+    if doc.nazwa_szablonu:
+        node["NazwaSzablonu"] = doc.nazwa_szablonu
     return JSONResponse({"response": node})
 
 
@@ -777,6 +783,8 @@ def seed_document(body: dict[str, Any]) -> dict[str, Any]:
         "Uwagi": body.get("uwagi") or "",
         "DodatkoweUwagi": body.get("dodatkowe_uwagi"),
     }
+    if body.get("nazwa_szablonu"):
+        payload["NazwaSzablonu"] = body["nazwa_szablonu"]
     if body.get("issue_date"):
         payload["DataWystawienia"] = body["issue_date"]
     payload["DataSprzedazy"] = (
@@ -1050,6 +1058,7 @@ def status_data() -> dict[str, Any]:
         row = _row(doc)
         row["deleted"] = doc.deleted
         row["created_by"] = doc.created_by
+        row["NazwaSzablonu"] = doc.nazwa_szablonu
         row["statuses"] = sorted(doc.statuses())
         documents.append(row)
     return {

@@ -376,3 +376,34 @@ def test_pdf_not_ready_rejects_bad_counts_and_reset_clears_it():
     assert client.post("/__mock/pdf-not-ready", json={"calls": 3}).status_code == 200
     assert client.post("/__mock/reset").status_code == 200
     assert client.get("/__mock/pdf-not-ready").json() == {"remaining": 0}
+
+
+# ----------------------------- document template ----------------------------- #
+def _template_node(**extra) -> dict:
+    node = {"Zaplacono": 0, "Uwagi": "PS-ORDER-1-ABCDEFGHI",
+            "Kontrahent": {"KodPocztowy": "00-001", "Miejscowosc": "Warszawa", "Nazwa": "Jan"},
+            "Pozycje": [{"NazwaPelna": "X", "Ilosc": 1, "CenaJednostkowa": 10, "StawkaVat": 0.23}]}
+    node.update(extra)
+    return node
+
+
+def test_create_with_template_name_is_read_back_in_detail_list_and_status_page():
+    created = post_json("/iapi/fakturaparagon.json", _template_node(NazwaSzablonu="Szablon SC Medical"))
+    assert created["Kod"] == 0
+    ident = created["Identyfikator"]
+    detail = get_json(f"/iapi/fakturaparagon/{ident}.json")
+    assert detail["NazwaSzablonu"] == "Szablon SC Medical"
+    assert listing()[0]["NazwaSzablonu"] == "Szablon SC Medical"
+    page = client.get("/__mock/status")
+    assert "Szablon SC Medical" in page.text
+    docs = client.get("/__mock/status.json").json()["documents"]
+    assert docs[0]["NazwaSzablonu"] == "Szablon SC Medical"
+
+
+def test_create_without_template_name_has_none_and_keeps_the_official_row():
+    created = post_json("/iapi/fakturaparagon.json", _template_node())
+    assert created["Kod"] == 0
+    detail = get_json(f"/iapi/fakturaparagon/{created['Identyfikator']}.json")
+    assert "NazwaSzablonu" not in detail
+    assert list(listing()[0].keys()) == ROW_KEYS
+    assert client.get("/__mock/status.json").json()["documents"][0]["NazwaSzablonu"] == ""
