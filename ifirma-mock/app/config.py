@@ -41,6 +41,9 @@ class Settings:
     #: Simulated rate limit: max authenticated calls per calendar minute (0 = off).
     rate_limit: int = int(os.getenv("IFIRMA_MOCK_RATE_LIMIT", "0") or 0)
 
+    #: Simulated rate limit: max authenticated calls per calendar day (0 = off).
+    rate_limit_day: int = int(os.getenv("IFIRMA_MOCK_RATE_LIMIT_DAY", "0") or 0)
+
     #: Enables the /__mock/* seeding endpoints (HTTP 404 when false).
     test_endpoints: bool = _env_bool("IFIRMA_MOCK_TEST_ENDPOINTS", True)
 

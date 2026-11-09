@@ -43,10 +43,10 @@ behaviour:
 | List / read number | `GET /iapi/faktury.json?dataOd=…` | `faktura` | `{"response":{"Kod":0,"Wynik":[{"FakturaId":…,"PelnyNumer":"…", …}]}}` |
 | List filters | `dataOd` (required, else Kod 201), `dataDo`, `kontrahent`, `nipKontrahenta`, `typ`, `status` (comma list of `oplacone,nieoplacone,oplaconeCzesciowo,przeterminowane`), `strona`, `iloscNaStronie`, `kwotaOd`, `kwotaDo` | `faktura` | Rows have the official key order (`KontrahentNazwa` … `KsefStatus`), no total count. Deleted documents are excluded |
 | List filter `kontrahent` | `GET /iapi/faktury.json?dataOd=…&kontrahent=<identifier>` | `faktura` | unknown contractor identifier → Kod 201 "Nie znaleziono kontrahenta o zadanym identyfikatorze" (observed on the live API 2026-11-02, not an empty list); known identifier → filtered rows; empty value → no filter. `nipKontrahenta` stays lenient (unknown NIP → empty list) |
-| Document detail | `GET /iapi/{type}/{id}.json` | `faktura` | `{"response":{"Kod":0,"Identyfikator":"…","PelnyNumer":"…","Zaplacono":…,"Uwagi":"…","DodatkoweUwagi":{…}, …}}`; unknown/deleted id → Kod 404 envelope (HTTP 200) |
+| Document detail | `GET /iapi/{type}/{id}.json` | `faktura` | `{"response":{"Kod":0,"Identyfikator":"…","PelnyNumer":"…","Zaplacono":…,"Uwagi":"…","DodatkoweUwagi":{…},"KsefStatus":"…","KsefNumer":"…", …}}` (the two KSeF fields are empty strings when the document has no KSeF state); unknown/deleted id → Kod 404 envelope (HTTP 200) |
 | Send by e-mail | `POST /iapi/{type}/send/{id}.json` body `Tekst`, `SkrzynkaEmailOdbiorcy`, … | `faktura` | Kod 0 "Wiadomość została wysłana." for `fakturakraj`, `fakturawysylka`, `fakturaproformakraj`, … ; `fakturaparagon` → Kod 200 (not available); `Tekst` > 1000 → Kod 201 |
-| Send invoice to KSeF | `POST /iapi/{type}/ksef/send/{id}.json` body `{"DataWysylki": null}` (null = send now, `YYYY-MM-DD` = scheduled); `{type}` may be `fakturakraj/korekta`; `{id}` = document id or number with `_` for `/` (e.g. `314_2026`) | `faktura` | Documented request. Response and message wording are the mock's own, unverified live: Kod 0 "Faktura została wysłana do KSeF." (status `WYSLANA`, or `ZAPLANOWANA` when a date is given; `KsefNumer` stays empty); unsupported type → Kod 200; missing key or invalid `DataWysylki` → Kod 201 `DataWysylki: nieprawidłowa wartość`; unknown id → Kod 201 "Nie znaleziono faktury o zadanym identyfikatorze"; already `WYSLANA`/`PRZYJETA` → Kod 201 "Faktura została już wysłana do KSeF" |
-| API usage limit | `GET /iapi/abonent/limit.json` | `abonent` | `{"response":{"Kod":0,"LimitWykorzystany":<calls served>,"LimitPrzyznany":15000}}` |
+| Send invoice to KSeF | `POST /iapi/{type}/ksef/send/{id}.json` body `{"DataWysylki": null}` (null = send now, `YYYY-MM-DD` = scheduled); `{type}` may be `fakturakraj/korekta`; `{id}` = document id or number with `_` for `/` (e.g. `314_2026`) | `faktura` | Documented request. Response and message wording are the mock's own, unverified live: Kod 0 "Faktura została wysłana do KSeF." (status `WYSLANA`, or `ZAPLANOWANA` when a date is given; `KsefNumer` stays empty); unsupported type → Kod 200; missing key or invalid `DataWysylki` → Kod 201 `DataWysylki: nieprawidłowa wartość`; unknown id → Kod 201 "Nie znaleziono faktury o zadanym identyfikatorze"; already `WYSLANA`, `ZAPLANOWANA` or `PRZYJETA` → Kod 201 "Faktura została już wysłana do KSeF". Every call that names a stored document is counted per document (`ksef_send_calls`), refused or not |
+| API usage limit | `GET /iapi/abonent/limit.json` | `abonent` | `{"response":{"Kod":0,"LimitWykorzystany":<calls served today>,"LimitPrzyznany":<day limit, 15000 when none is set>}}` |
 | Contractor by id | `GET /iapi/kontrahenci/id/{identifier}.json` | `faktura` | found: `{"response":{"Kod":0,"Informacja":"","Wynik":[<contractor>]}}`; not found: Kod 208 "Nie znaleziono kontrahenta" |
 | Create contractor | `POST /iapi/kontrahenci.json` | `faktura` | Kod 0 "Dodano kontrahenta" with `Wynik` = identifier; missing `Nazwa`/`KodPocztowy`/`Miejscowosc` → Kod 201 `Validation errors: …`; identifier > 15 chars or already existing → Kod 201 |
 | Replace contractor | `PUT /iapi/kontrahenci/{identifier}.json` | `faktura` | Kod 0 "Zaktualizowano kontrahenta" (full replace, identifier kept); unknown → Kod 208 |
@@ -271,11 +271,11 @@ curl -X POST http://localhost:8001/__mock/documents -H 'Content-Type: applicatio
 # delete it again (disappears from lists and detail)
 curl -X DELETE http://localhost:8001/__mock/documents/1
 
-# wipe all documents, contractors, call counters and the three switches below, and clear the stored state file
+# wipe all documents, contractors, call counters, the runtime rate limits and the four switches below, and clear the stored state file
 curl -X POST http://localhost:8001/__mock/reset
 ```
 
-Three switches reproduce iFirma behaviour the module must handle. All are test-only (no HMAC,
+Four switches reproduce iFirma behaviour the module must handle. All are test-only (no HMAC,
 disabled with `IFIRMA_MOCK_TEST_ENDPOINTS=false`) and are restored to their defaults by `/__mock/reset`:
 
 ```bash
@@ -299,6 +299,15 @@ curl http://localhost:8001/__mock/pdf-not-ready     # {"remaining": 2}
 # non-empty Pozycje). Cleared by /__mock/reset.
 curl -X POST http://localhost:8001/__mock/legacy-mode -H 'Content-Type: application/json' -d '{"enabled": true}'
 curl http://localhost:8001/__mock/legacy-mode       # {"enabled": true}
+
+# ksef-auto (off by default): behave like an iFirma account that submits invoices to KSeF on its own
+# (iFirma can do that at a time set in its settings). While "send", every document created through
+# POST /iapi/fakturakraj.json or fakturaparagon.json for a buyer with a NIP is stored with KsefStatus
+# WYSLANA; while "accept" it is stored PRZYJETA with a generated KsefNumer. Receipts and invoices for a
+# buyer without a NIP, and documents seeded through /__mock/documents, are not touched. No KSeF send
+# call is needed or counted. Cleared by /__mock/reset.
+curl -X POST http://localhost:8001/__mock/ksef-auto -H 'Content-Type: application/json' -d '{"mode": "send"}'
+curl http://localhost:8001/__mock/ksef-auto         # {"mode": "send"}
 ```
 
 The upgrade test from 1.0.0 mounts the 1.0.0 tree of the module instead of the working tree with
@@ -324,11 +333,53 @@ Accepted body fields: `doc_type`, `contractor`, `gross` or `Pozycje`, `currency`
 `FormatDatySprzedazy`, both echoed by the detail endpoint. When `sale_date` is absent it
 defaults to `issue_date` (or today if that is absent too); `sale_date_format` defaults to `DZN`.
 
+## Rate limits
+
+iFirma allows 100 requests per minute and 15,000 per day per account. The mock simulates both on its
+own clock: every authenticated `/iapi/*` call counts in the current calendar minute and the current
+calendar day (refused calls count too), and a call over either limit is refused, minute first. A limit
+of `0` is "no limit". The compose stack sets `100` and `15000` and the mock's timezone to
+`Europe/Warsaw`, so its day matches the shop's.
+
+A refused call is answered with **HTTP 429**, a `Retry-After` header (whole seconds until the refusing
+window ends, at least 1) and this body, and has no other effect (a refused create stores nothing, a
+refused KSeF send changes no state):
+
+```json
+{"response": {"Kod": 100, "Informacja": "Przekroczono limit zapytań (limit minutowy: 100)"}}
+```
+
+The window word is `limit minutowy` or `limit dzienny`. The body shape and the 429 are the mock's own
+choice (iFirma documents no limit answer), so the module recognises either the status or the phrase.
+
+Test-only routes (no HMAC, `IFIRMA_MOCK_TEST_ENDPOINTS`; restored by `/__mock/reset`):
+
+| Route | Effect |
+|-------|--------|
+| `GET /__mock/rate-limit` | `per_minute`, `per_day` (in force), `defaults` (from the environment), `calls_this_minute`, `calls_today`, `calls_total`, `rejected_total` (refused calls), `peak_minute` (most calls in any one calendar minute since the last reset) |
+| `POST /__mock/rate-limit` | body `{"per_minute": n, "per_day": m}`, either key, non-negative integers; anything else is 422 and changes nothing |
+| `POST /__mock/rate-limit/next-window` | body `{"window": "minute"}` or `"day"` clears that window's count as if it had ended (total and the other window untouched); another value is 422 |
+
+```bash
+# provoke a refusal after 5 calls in a minute, look at it, and move on without waiting
+curl -X POST http://localhost:8001/__mock/rate-limit -H 'Content-Type: application/json' -d '{"per_minute": 5}'
+# ... make 6 signed calls; the sixth answers HTTP 429 with Retry-After ...
+curl http://localhost:8001/__mock/rate-limit        # "rejected_total": 1, "peak_minute": 6
+curl -X POST http://localhost:8001/__mock/rate-limit/next-window -H 'Content-Type: application/json' -d '{"window": "minute"}'
+curl -X POST http://localhost:8001/__mock/reset     # limits are back to the environment values
+```
+
+The status page shows the limits next to their environment defaults and the counters, and has a form for
+both limits plus next-minute and next-day buttons (`/__mock/status.json` carries the same as `rate_limit`).
+The limits, the day count and the refused-call total survive a restart (the minute count does not).
+
 ## Mock settings
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `IFIRMA_MOCK_RATE_LIMIT` | `0` (off) | When `N > 0`, the (N+1)th authenticated `/iapi/*` call within a calendar minute is answered with Kod 100 "Przekroczono limit zapytań" |
+| `IFIRMA_MOCK_RATE_LIMIT` | `0` (off); compose: `100` | When `N > 0`, the (N+1)th authenticated `/iapi/*` call within a calendar minute is refused with HTTP 429, `Retry-After` and Kod 100 "Przekroczono limit zapytań (limit minutowy: N)" (see "Rate limits") |
+| `IFIRMA_MOCK_RATE_LIMIT_DAY` | `0` (off); compose: `15000` | The same per calendar day ("limit dzienny"); also the `LimitPrzyznany` of `abonent/limit.json` (15000 when off) |
+| `TZ` | image default (UTC); compose: `Europe/Warsaw` | Zone of the mock's calendar day (and of its log timestamps) |
 | `IFIRMA_MOCK_TEST_ENDPOINTS` | `true` | Enables `/__mock/*`; when `false` they return HTTP 404 |
 | `IFIRMA_MOCK_STRICT_LIST_WINDOW` | `false` | When `true`, `faktury.json` without `dataDo` uses the real API's `dataOd + 30 days` window (off by default so a plain `dataOd=2020-01-01` call still lists new documents) |
 | `IFIRMA_MOCK_KEY_ABONENT` | empty | Key for `abonent/limit.json`; empty means that endpoint always answers 401 |

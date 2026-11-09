@@ -280,13 +280,20 @@ def test_limit_without_abonent_key_is_rejected():
 
 
 def test_rate_limit_triggers_kod_100():
+    # Deliberate change (add-rate-limit-queue-and-ksef-confirmed-delivery, task 1.2): the refusal
+    # now carries HTTP 429 and Retry-After, like the limit answer the module has to recognise.
     settings.rate_limit = 2
-    ok1 = get_json("/iapi/faktury.json", "dataOd=2020-01-01")
-    ok2 = get_json("/iapi/faktury.json", "dataOd=2020-01-01")
-    limited = get_json("/iapi/faktury.json", "dataOd=2020-01-01")
-    assert ok1["Kod"] == 0 and ok2["Kod"] == 0
-    assert limited["Kod"] == 100
-    assert "limit" in limited["Informacja"]
+    path = "/iapi/faktury.json"
+    headers = {"Authentication": sign(path, "faktura", "")}
+    url = path + "?dataOd=2020-01-01"
+    ok1 = client.get(url, headers=headers)
+    ok2 = client.get(url, headers=headers)
+    limited = client.get(url, headers=headers)
+    assert ok1.json()["response"]["Kod"] == 0 and ok2.json()["response"]["Kod"] == 0
+    assert limited.status_code == 429
+    assert int(limited.headers["Retry-After"]) >= 1
+    assert limited.json()["response"]["Kod"] == 100
+    assert "limit" in limited.json()["response"]["Informacja"]
 
 
 # ----------------------------- test endpoints ------------------------------- #

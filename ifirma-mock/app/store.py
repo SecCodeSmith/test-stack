@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import math
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Callable
+
+from .config import settings
 
 _lock = threading.Lock()
 _next_document_id = 1
@@ -24,11 +27,27 @@ _next_document_id = 1
 #: Listener called under the lock with a snapshot after every mutation (None = memory only).
 _listener: Callable[[dict[str, Any]], None] | None = None
 
+#: The mock's clock, a seam so tests move time without sleeping.
+_now: Callable[[], float] = time.time
+
 #: Authenticated-call accounting (feeds abonent/limit.json and the rate-limit simulation).
-#: The per-minute window is kept in memory only and is not part of the snapshot.
+#: The per-minute window and the busiest-minute count are kept in memory only and are not part
+#: of the snapshot; the day window, the refused-call total and the runtime limits are.
 _calls_total = 0
 _calls_minute: int | None = None
 _calls_minute_count = 0
+_calls_day_key = ""
+_calls_day = 0
+_rejected_total = 0
+_peak_minute = 0
+
+#: Runtime limits set through /__mock/rate-limit; None means "use the environment value".
+_limit_minute: int | None = None
+_limit_day: int | None = None
+
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_DAY = 86400
+RATE_WINDOWS = ("minute", "day")
 
 RODZAJ_MAP = {
     "fakturaparagon": "prz_faktura_paragon",
@@ -84,6 +103,7 @@ class Document:
     linked_document: str | None = None
     ksef_status: str | None = None
     ksef_number: str | None = None
+    ksef_send_calls: int = 0
 
     @property
     def rodzaj(self) -> str:
@@ -332,13 +352,33 @@ def legacy_mode() -> bool:
 
 
 def reset_test_switches() -> None:
-    """Restore normal contractor creation, clear the PDF-not-ready counter, legacy mode and the mail reject switch."""
-    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode, _mail_reject
+    """Restore normal contractor creation, clear the PDF-not-ready counter, legacy mode, the mail reject switch and KSeF auto-send."""
+    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode, _mail_reject, _ksef_auto
     with _lock:
         _contractor_create_mode = "normal"
         _pdf_not_ready_remaining = 0
         _legacy_mode = False
         _mail_reject = False
+        _ksef_auto = "off"
+        _changed()
+
+
+#: Account-level KSeF behaviour: does iFirma submit (and KSeF accept) new invoices by itself?
+KSEF_AUTO_MODES = ("off", "send", "accept")
+_ksef_auto = "off"
+
+
+def ksef_auto() -> str:
+    with _lock:
+        return _ksef_auto
+
+
+def set_ksef_auto(mode: str) -> None:
+    global _ksef_auto
+    if mode not in KSEF_AUTO_MODES:
+        raise ValueError(f"unknown KSeF auto-send mode {mode!r}")
+    with _lock:
+        _ksef_auto = mode
         _changed()
 
 
@@ -447,6 +487,17 @@ def set_ksef_status(doc_id: int, status: str | None, number: str | None = None) 
         return doc
 
 
+def count_ksef_send(doc_id: int) -> Document | None:
+    """Count one KSeF send call that named the document; None when it is unknown."""
+    with _lock:
+        doc = _documents.get(doc_id)
+        if doc is None:
+            return None
+        doc.ksef_send_calls += 1
+        _changed()
+        return doc
+
+
 def mark_sent(doc_id: int, recipient: str | None) -> Document | None:
     """Flag a document as e-mailed and remember the recipient; None when unknown."""
     with _lock:
@@ -463,19 +514,80 @@ def mark_sent(doc_id: int, recipient: str | None) -> Document | None:
 # --------------------------------------------------------------------------- #
 # Call accounting                                                              #
 # --------------------------------------------------------------------------- #
-def register_call() -> int:
-    """Count an authenticated call; return how many were counted in the current minute."""
-    global _calls_total, _calls_minute, _calls_minute_count
-    minute = int(time.time() // 60)
+@dataclass(frozen=True)
+class CallVerdict:
+    """Whether the simulated limits let a call through, and which window refused it."""
+
+    allowed: bool
+    window: str | None = None
+    limit: int = 0
+    retry_after: int = 0
+
+
+def _day_key(now: float) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(now))
+
+
+def _seconds_left_in_minute(now: float) -> int:
+    return max(1, math.ceil(SECONDS_PER_MINUTE - now % SECONDS_PER_MINUTE))
+
+
+def _seconds_left_in_day(now: float) -> int:
+    local = time.localtime(now)
+    elapsed = local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec + now % 1
+    return max(1, math.ceil(SECONDS_PER_DAY - elapsed))
+
+
+def limit_minute() -> int:
+    """Effective per-minute limit (0 = off): the runtime value, else the environment's."""
+    return settings.rate_limit if _limit_minute is None else _limit_minute
+
+
+def limit_day() -> int:
+    """Effective per-day limit (0 = off): the runtime value, else the environment's."""
+    return settings.rate_limit_day if _limit_day is None else _limit_day
+
+
+def _roll_windows_unlocked(now: float) -> None:
+    global _calls_minute, _calls_minute_count, _calls_day_key, _calls_day
+    minute = int(now // SECONDS_PER_MINUTE)
+    if _calls_minute != minute:
+        _calls_minute = minute
+        _calls_minute_count = 0
+    day_key = _day_key(now)
+    if _calls_day_key != day_key:
+        _calls_day_key = day_key
+        _calls_day = 0
+
+
+def _verdict_unlocked(now: float) -> CallVerdict:
+    per_minute = limit_minute()
+    if per_minute > 0 and _calls_minute_count > per_minute:
+        return CallVerdict(False, "minute", per_minute, _seconds_left_in_minute(now))
+    per_day = limit_day()
+    if per_day > 0 and _calls_day > per_day:
+        return CallVerdict(False, "day", per_day, _seconds_left_in_day(now))
+    return CallVerdict(True)
+
+
+def register_call() -> CallVerdict:
+    """Count an authenticated call in the total, the minute and the day, then judge it.
+
+    Refused calls count too, as they do at iFirma, so a client that keeps calling stays refused.
+    """
+    global _calls_total, _calls_minute_count, _calls_day, _rejected_total, _peak_minute
+    now = _now()
     with _lock:
-        if _calls_minute != minute:
-            _calls_minute = minute
-            _calls_minute_count = 0
+        _roll_windows_unlocked(now)
         _calls_total += 1
         _calls_minute_count += 1
-        count = _calls_minute_count
+        _calls_day += 1
+        _peak_minute = max(_peak_minute, _calls_minute_count)
+        verdict = _verdict_unlocked(now)
+        if not verdict.allowed:
+            _rejected_total += 1
         _changed()
-        return count
+        return verdict
 
 
 def calls_total() -> int:
@@ -485,9 +597,51 @@ def calls_total() -> int:
 
 def calls_this_minute() -> int:
     with _lock:
-        if _calls_minute != int(time.time() // 60):
+        if _calls_minute != int(_now() // SECONDS_PER_MINUTE):
             return 0
         return _calls_minute_count
+
+
+def calls_today() -> int:
+    with _lock:
+        if _calls_day_key != _day_key(_now()):
+            return 0
+        return _calls_day
+
+
+def rejected_total() -> int:
+    with _lock:
+        return _rejected_total
+
+
+def peak_minute() -> int:
+    with _lock:
+        return _peak_minute
+
+
+def set_rate_limits(per_minute: int | None = None, per_day: int | None = None) -> None:
+    """Set either runtime limit (0 = off); a limit left as None keeps its value."""
+    global _limit_minute, _limit_day
+    with _lock:
+        if per_minute is not None:
+            _limit_minute = per_minute
+        if per_day is not None:
+            _limit_day = per_day
+        _changed()
+
+
+def next_window(window: str) -> None:
+    """Clear the count of one window as if it had ended; the total and the other window stay."""
+    global _calls_minute_count, _calls_day
+    if window not in RATE_WINDOWS:
+        raise ValueError(f"unknown window {window!r}")
+    with _lock:
+        _roll_windows_unlocked(_now())
+        if window == "minute":
+            _calls_minute_count = 0
+        else:
+            _calls_day = 0
+        _changed()
 
 
 # --------------------------------------------------------------------------- #
@@ -556,7 +710,8 @@ def mail_reject() -> bool:
 def _clear_unlocked(keep_mail: bool = False) -> None:
     """Empty everything; `restore()` passes keep_mail=True (the mailbox is not part of a snapshot)."""
     global _next_document_id, _next_contractor_seq, _calls_total, _calls_minute, _calls_minute_count
-    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode
+    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode, _ksef_auto
+    global _calls_day_key, _calls_day, _rejected_total, _peak_minute, _limit_minute, _limit_day
     if not keep_mail:
         _clear_mail_unlocked()
     _documents.clear()
@@ -566,13 +721,20 @@ def _clear_unlocked(keep_mail: bool = False) -> None:
     _contractor_create_mode = "normal"
     _pdf_not_ready_remaining = 0
     _legacy_mode = False
+    _ksef_auto = "off"
     _calls_total = 0
     _calls_minute = None
     _calls_minute_count = 0
+    _calls_day_key = ""
+    _calls_day = 0
+    _rejected_total = 0
+    _peak_minute = 0
+    _limit_minute = None
+    _limit_day = None
 
 
 def reset_all() -> None:
-    """Clear documents, contractors, both sequences, the switches and the call counters."""
+    """Clear documents, contractors, both sequences, the switches, the limits and the call counters."""
     with _lock:
         _clear_unlocked()
         _changed()
@@ -601,13 +763,18 @@ def _snapshot_unlocked() -> dict[str, Any]:
             "contractor_create_mode": _contractor_create_mode,
             "pdf_not_ready_remaining": _pdf_not_ready_remaining,
             "legacy_mode": _legacy_mode,
+            "ksef_auto": _ksef_auto,
         },
         "calls_total": _calls_total,
+        "calls_day": {"day_key": _calls_day_key, "count": _calls_day},
+        "rejected_total": _rejected_total,
+        "limit_minute": _limit_minute,
+        "limit_day": _limit_day,
     }
 
 
 def snapshot() -> dict[str, Any]:
-    """The whole mutable state as a plain, JSON-serialisable dict (rate-limit window excluded)."""
+    """The whole mutable state as a plain, JSON-serialisable dict (per-minute window excluded)."""
     with _lock:
         return _snapshot_unlocked()
 
@@ -619,7 +786,8 @@ def restore(data: dict[str, Any]) -> None:
     or newer file still loads. A document without ``ifirma_id`` is skipped.
     """
     global _next_document_id, _next_contractor_seq, _calls_total
-    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode
+    global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode, _ksef_auto
+    global _calls_day_key, _calls_day, _rejected_total, _limit_minute, _limit_day
     known = {f.name for f in dataclasses.fields(Document)}
     documents: dict[int, Document] = {}
     for raw in data.get("documents") or []:
@@ -637,7 +805,15 @@ def restore(data: dict[str, Any]) -> None:
     next_doc = max(int(data.get("next_document_id") or 1), max(documents, default=0) + 1)
     next_seq = max(int(data.get("next_contractor_seq") or 1), 1)
     pdf_remaining = max(0, int(switches.get("pdf_not_ready_remaining") or 0))
+    saved_auto = switches.get("ksef_auto", "off")
+    auto_mode = saved_auto if saved_auto in KSEF_AUTO_MODES else "off"
     calls = max(0, int(data.get("calls_total") or 0))
+    day = data.get("calls_day") or {}
+    day_key = str(day.get("day_key") or "")
+    day_count = max(0, int(day.get("count") or 0)) if day_key == _day_key(_now()) else 0
+    rejected = max(0, int(data.get("rejected_total") or 0))
+    saved_minute = data.get("limit_minute")
+    saved_day = data.get("limit_day")
     with _lock:
         _clear_unlocked(keep_mail=True)
         _documents.update(documents)
@@ -647,7 +823,13 @@ def restore(data: dict[str, Any]) -> None:
         _contractor_create_mode = mode if mode in CONTRACTOR_CREATE_MODES else "normal"
         _pdf_not_ready_remaining = pdf_remaining
         _legacy_mode = bool(switches.get("legacy_mode", False))
+        _ksef_auto = auto_mode
         _calls_total = calls
+        _calls_day_key = day_key if day_count else ""
+        _calls_day = day_count
+        _rejected_total = rejected
+        _limit_minute = max(0, int(saved_minute)) if saved_minute is not None else None
+        _limit_day = max(0, int(saved_day)) if saved_day is not None else None
         _changed()
 
 

@@ -37,8 +37,12 @@ services:
       # Must equal the module's base URL minus the trailing "/iapi/" path.
       IFIRMA_MOCK_BASE_URL: http://ifirma-mock:8001
       IFIRMA_MOCK_STRICT_AUTH: "true"
-      # Simulated API rate limit: max authenticated calls per minute (0 = off).
-      IFIRMA_MOCK_RATE_LIMIT: ${IFIRMA_MOCK_RATE_LIMIT:-0}
+      # Simulated API rate limits, iFirma's own by default: 100 authenticated calls per calendar
+      # minute and 15000 per calendar day (0 = off). A refused call gets HTTP 429 with Retry-After.
+      IFIRMA_MOCK_RATE_LIMIT: ${IFIRMA_MOCK_RATE_LIMIT:-100}
+      IFIRMA_MOCK_RATE_LIMIT_DAY: ${IFIRMA_MOCK_RATE_LIMIT_DAY:-15000}
+      # The mock's calendar day follows this zone, so it matches the shop's day.
+      TZ: Europe/Warsaw
       # Enables the /__mock/* seeding endpoints (set "false" to get HTTP 404).
       IFIRMA_MOCK_TEST_ENDPOINTS: ${IFIRMA_MOCK_TEST_ENDPOINTS:-true}
       # Keeps documents, contractors, sequences, switches and the call counter across restarts

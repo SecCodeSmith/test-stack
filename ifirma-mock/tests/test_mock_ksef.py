@@ -9,6 +9,7 @@ and PDF routes that share the /iapi/ prefix.
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import date
 
@@ -165,3 +166,159 @@ def test_regression_pdf_route_still_works():
     resp = client.get(path, headers={"Authentication": sign(path, "faktura", "")})
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/pdf"
+
+
+# --------------------------------------------------------------------------- #
+# KSeF simulation beyond the send endpoint (spec mock-ksef-simulation)         #
+# --------------------------------------------------------------------------- #
+from app import store  # noqa: E402
+
+BUYER_WITH_NIP = {"Nazwa": "Firma", "NIP": "5260001122",
+                  "KodPocztowy": "00-001", "Miejscowosc": "Warszawa"}
+BUYER_PRIVATE = {"Nazwa": "Jan Kowalski",
+                 "KodPocztowy": "00-001", "Miejscowosc": "Warszawa"}
+
+
+def api_create(doc_type: str, buyer: dict) -> int:
+    payload = {"Kontrahent": dict(buyer),
+               "Pozycje": [{"NazwaPelna": "Usługa", "Ilosc": 1, "CenaJednostkowa": 100.0,
+                            "StawkaVat": 0.23, "TypStawkiVat": "PRC"}]}
+    resp = post_json(f"/iapi/{doc_type}.json", payload)
+    assert resp["Kod"] == 0, resp
+    return int(resp["Identyfikator"])
+
+
+def detail(doc_type: str, doc_id: int) -> dict:
+    resp = get_json(f"/iapi/{doc_type}/{doc_id}.json")
+    assert resp["Kod"] == 0, resp
+    return resp
+
+
+def set_ksef_auto(mode: str):
+    return client.post("/__mock/ksef-auto", json={"mode": mode})
+
+
+def test_detail_of_a_submitted_invoice_carries_the_ksef_state():
+    doc = seed(doc_type="fakturakraj")
+    ksef_send("fakturakraj", str(doc["FakturaId"]), {"DataWysylki": None})
+    answer = detail("fakturakraj", doc["FakturaId"])
+    assert (answer["KsefStatus"], answer["KsefNumer"]) == ("WYSLANA", "")
+
+
+def test_detail_of_an_accepted_invoice_matches_the_list():
+    doc = seed(doc_type="fakturakraj")
+    ident = str(doc["FakturaId"])
+    ksef_send("fakturakraj", ident, {"DataWysylki": None})
+    client.post(f"/__mock/ksef/accept/{ident}")
+    answer = detail("fakturakraj", doc["FakturaId"])
+    row = row_for(doc["FakturaId"])
+    assert answer["KsefStatus"] == "PRZYJETA"
+    assert answer["KsefNumer"] == row["KsefNumer"] != ""
+
+
+def test_detail_of_a_document_without_ksef_state_has_empty_strings():
+    doc = seed(doc_type="fakturaparagon")
+    answer = detail("fakturaparagon", doc["FakturaId"])
+    assert (answer["KsefStatus"], answer["KsefNumer"]) == ("", "")
+
+
+def test_ksef_auto_is_off_by_default():
+    assert client.get("/__mock/ksef-auto").json() == {"mode": "off"}
+    doc_id = api_create("fakturakraj", BUYER_WITH_NIP)
+    assert detail("fakturakraj", doc_id)["KsefStatus"] == ""
+
+
+def test_ksef_auto_send_marks_a_new_invoice_for_a_buyer_with_a_nip():
+    assert set_ksef_auto("send").json() == {"mode": "send"}
+    doc_id = api_create("fakturakraj", BUYER_WITH_NIP)
+    assert detail("fakturakraj", doc_id)["KsefStatus"] == "WYSLANA"
+    assert row_for(doc_id)["KsefStatus"] == "WYSLANA"
+    assert store.get(doc_id).ksef_send_calls == 0
+
+
+def test_ksef_auto_accept_stores_przyjeta_with_a_number():
+    set_ksef_auto("accept")
+    doc_id = api_create("fakturakraj", BUYER_WITH_NIP)
+    answer = detail("fakturakraj", doc_id)
+    assert answer["KsefStatus"] == "PRZYJETA"
+    assert KSEF_NUMBER_RE.match(answer["KsefNumer"])
+    assert answer["KsefNumer"].startswith("5260001122-")
+
+
+@pytest.mark.parametrize("doc_type, buyer", [
+    ("fakturaparagon", BUYER_PRIVATE),
+    ("fakturakraj", BUYER_PRIVATE),
+])
+def test_ksef_auto_leaves_a_buyer_without_a_nip_alone(doc_type, buyer):
+    set_ksef_auto("send")
+    doc_id = api_create(doc_type, buyer)
+    assert detail(doc_type, doc_id)["KsefStatus"] == ""
+
+
+def test_ksef_auto_does_not_touch_seeded_external_documents():
+    set_ksef_auto("send")
+    doc = seed(doc_type="fakturakraj")
+    assert row_for(doc["FakturaId"])["KsefStatus"] is None
+
+
+@pytest.mark.parametrize("body", [{"mode": "maybe"}, {"mode": 1}, {}, [], {"mode": "send", "x": 1}])
+def test_ksef_auto_refuses_an_invalid_mode(body):
+    set_ksef_auto("send")
+    resp = client.post("/__mock/ksef-auto", json=body)
+    assert resp.status_code == 422
+    assert client.get("/__mock/ksef-auto").json() == {"mode": "send"}
+
+
+def test_reset_sets_ksef_auto_back_to_off():
+    set_ksef_auto("accept")
+    client.post("/__mock/reset")
+    assert client.get("/__mock/ksef-auto").json() == {"mode": "off"}
+
+
+def test_ksef_auto_routes_answer_404_when_test_endpoints_are_off():
+    settings.test_endpoints = False
+    assert client.get("/__mock/ksef-auto").status_code == 404
+    assert client.post("/__mock/ksef-auto", json={"mode": "send"}).status_code == 404
+
+
+def test_one_submission_counts_one_send_call():
+    doc = seed(doc_type="fakturakraj")
+    ksef_send("fakturakraj", str(doc["FakturaId"]), {"DataWysylki": None})
+    assert store.get(doc["FakturaId"]).ksef_send_calls == 1
+
+
+def test_a_refused_second_submission_is_counted_too():
+    doc = seed(doc_type="fakturakraj")
+    ident = str(doc["FakturaId"])
+    ksef_send("fakturakraj", ident, {"DataWysylki": None})
+    answer = ksef_send("fakturakraj", ident, {"DataWysylki": None})
+    assert answer["Kod"] != 0 and "już wysłana do KSeF" in answer["Informacja"]
+    assert store.get(doc["FakturaId"]).ksef_send_calls == 2
+
+
+def test_a_scheduled_invoice_refuses_another_send():
+    doc = seed(doc_type="fakturakraj")
+    ident = str(doc["FakturaId"])
+    ksef_send("fakturakraj", ident, {"DataWysylki": "2026-12-01"})
+    answer = ksef_send("fakturakraj", ident, {"DataWysylki": None})
+    assert answer["Kod"] != 0 and "już wysłana do KSeF" in answer["Informacja"]
+    assert row_for(doc["FakturaId"])["KsefStatus"] == "ZAPLANOWANA"
+
+
+def test_a_send_refused_by_the_rate_limit_changes_nothing():
+    doc = seed(doc_type="fakturakraj")
+    ident = str(doc["FakturaId"])
+    store.set_rate_limits(per_minute=1)
+    store.register_call()
+    path = f"/iapi/fakturakraj/ksef/send/{ident}.json"
+    body = json.dumps({"DataWysylki": None})
+    resp = client.post(path, content=body, headers={"Authentication": sign(path, "faktura", body),
+                                                    "Content-Type": "application/json"})
+    assert resp.status_code == 429
+    assert row_for_unlimited(doc["FakturaId"])["KsefStatus"] is None
+    assert store.get(doc["FakturaId"]).ksef_send_calls == 0
+
+
+def row_for_unlimited(doc_id: int) -> dict:
+    store.set_rate_limits(per_minute=0)
+    return row_for(doc_id)
