@@ -64,7 +64,7 @@ services:
     networks: [ifirma]
 
   prestashop:
-    image: prestashop/prestashop:latest
+    image: prestashop/prestashop:${PS_IMAGE_TAG:-9.1.4-apache}
     container_name: ifirma_prestashop
     restart: unless-stopped
     depends_on:

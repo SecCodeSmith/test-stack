@@ -7,7 +7,7 @@ A self-contained test harness for the PrestaShop **`ifirma`** module. It lives a
 - **`ifirma-mock/`** — a **FastAPI** service that mocks the iFirma API and an SMTP sink. It implements
   the exact endpoints the module calls **and validates the module's HMAC-SHA1
   signature**, so signing bugs surface immediately.
-- **`docker-compose.yml`** — boots **PrestaShop (latest)** + **MariaDB** + the mock,
+- **`docker-compose.yml`** — boots **PrestaShop (pinned, default 9.1.4)** + **MariaDB** + the mock,
   with the module bind-mounted live into PrestaShop.
 
 The module repository's [architecture page](https://github.com/SecCodeSmith/prestashop-integration-with-iFirma/blob/master/docs/architecture.md) describes how the stack and the mock fit the module.
@@ -389,8 +389,10 @@ The limits, the day count and the refused-call total survive a restart (the minu
 
 ## Notes
 
-- `prestashop/prestashop:latest` is used as requested. Pin a tag (e.g.
-  `prestashop/prestashop:9`) in `docker-compose.yml` for reproducible runs.
+- The PrestaShop image is pinned: `prestashop/prestashop:${PS_IMAGE_TAG:-9.1.4-apache}`. Test another supported
+  version by setting `PS_IMAGE_TAG` (`8.0.5-apache`, `8.1.7-apache`, `8.2.2-apache`, `9.0.3-apache`, `9.1.4-apache`);
+  the parent repository's `smoke` workflow runs the smoke scenarios against all of them. Never use `latest`:
+  CI rejects unpinned images (`tools/check_pinned_images.py`).
 - `make destroy` wipes the DB and PrestaShop volumes for a clean reinstall.
 - Because the module folder (repo parent) is bind-mounted, its own `test-stack/`
   appears under `modules/ifirma/test-stack` inside the container — harmless; PrestaShop
