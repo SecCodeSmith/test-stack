@@ -282,14 +282,19 @@ def test_reset_clicked():
 def test_script_reads_the_state():
     seed()
     data = client.get("/__mock/status.json").json()
+    # Deliberate change (add-rate-limit-queue-and-ksef-confirmed-delivery): the twin also carries the
+    # day limit, the new counters, the `rate_limit` object and the KSeF auto-send switch.
     assert set(data) == {"service", "version", "settings", "persistence", "counters", "switches",
-                         "documents", "contractors", "mail"}
+                         "documents", "contractors", "mail", "rate_limit"}
     assert data["version"] == app.version
-    assert set(data["settings"]) == {"user", "base_url", "strict_auth", "rate_limit",
+    assert set(data["settings"]) == {"user", "base_url", "strict_auth", "rate_limit", "rate_limit_day",
                                      "strict_list_window", "test_endpoints", "smtp_port"}
-    assert set(data["counters"]) == {"calls_total", "calls_this_minute", "limit_granted"}
+    assert set(data["counters"]) == {"calls_total", "calls_this_minute", "calls_today", "rejected_total",
+                                     "peak_minute", "limit_granted"}
+    assert set(data["rate_limit"]) == {"per_minute", "per_day", "defaults", "calls_this_minute",
+                                       "calls_today", "calls_total", "rejected_total", "peak_minute"}
     assert set(data["switches"]) == {"contractor_mode", "pdf_not_ready_remaining", "legacy_mode",
-                                    "mail_reject"}
+                                    "mail_reject", "ksef_auto"}
     assert set(data["persistence"]) == {"mode", "path", "last_write", "clean_start", "loaded_from_file"}
     doc = data["documents"][0]
     assert {"deleted", "created_by", "statuses", "KsefStatus", "PelnyNumer"} <= set(doc)
@@ -417,3 +422,117 @@ def test_mail_form_routes_are_404_when_test_endpoints_are_off(monkeypatch):
     assert post("/__mock/ui/mail/clear").status_code == 404
     assert post("/__mock/ui/switch/mail-reject", value="true").status_code == 404
     assert store.mail_reject() is False
+
+
+# --------------------------------------------------------------------------- #
+# Requirement: limits, refusals, KSeF auto-send and KSeF send calls            #
+# --------------------------------------------------------------------------- #
+def refuse_calls(count: int) -> None:
+    """Make `count` authenticated calls over the per-minute limit currently set."""
+    path = "/iapi/faktury.json"
+    for _ in range(count):
+        client.get(path + "?dataOd=2020-01-01", headers={"Authentication": sign(path, "faktura", "")})
+
+
+def test_limits_and_refusals_are_shown(monkeypatch):
+    monkeypatch.setattr(settings, "rate_limit", 100)
+    store.set_rate_limits(per_minute=1)
+    refuse_calls(3)
+    store.set_rate_limits(per_minute=30)
+    html = page()
+    assert "<dt>Rate limit per minute</dt><dd>30 (environment default 100)</dd>" in html
+    assert "<dt>Refused calls</dt><dd>2</dd>" in html
+    assert "<dt>Busiest minute</dt><dd>3</dd>" in html
+
+
+def test_the_page_says_off_for_a_limit_that_is_off(monkeypatch):
+    monkeypatch.setattr(settings, "rate_limit_day", 0)
+    assert "<dt>Rate limit per day</dt><dd>off (environment default off)</dd>" in page()
+
+
+def test_ksef_send_calls_are_shown_on_the_page_and_in_the_json():
+    doc = seed(doc_type="fakturakraj")
+    store.count_ksef_send(doc.ifirma_id)
+    store.count_ksef_send(doc.ifirma_id)
+    assert "<th>KSeF send calls</th>" in page()
+    assert "<td>2</td>" in page()
+    entry = client.get("/__mock/status.json").json()["documents"][0]
+    assert entry["ksef_send_calls"] == 2
+
+
+def test_ksef_auto_send_set_from_the_page():
+    assert "msg" in redirect(post("/__mock/ui/switch/ksef-auto", value="send"))
+    assert client.get("/__mock/ksef-auto").json() == {"mode": "send"}
+    assert "<legend>KSeF auto-send</legend><p>Current: <strong>send</strong></p>" in page()
+
+
+def test_an_invalid_ksef_auto_value_from_the_page_is_an_error():
+    assert "error" in redirect(post("/__mock/ui/switch/ksef-auto", value="always"))
+    assert client.get("/__mock/ksef-auto").json() == {"mode": "off"}
+
+
+def test_rate_limits_set_from_the_page():
+    assert "msg" in redirect(post("/__mock/ui/rate-limit", per_minute="30", per_day="500"))
+    report = client.get("/__mock/rate-limit").json()
+    assert (report["per_minute"], report["per_day"]) == (30, 500)
+
+
+def test_a_blank_field_leaves_that_limit_alone():
+    store.set_rate_limits(per_minute=7, per_day=9)
+    redirect(post("/__mock/ui/rate-limit", per_minute="", per_day="11"))
+    assert (store.limit_minute(), store.limit_day()) == (7, 11)
+
+
+@pytest.mark.parametrize("fields", [
+    {"per_minute": "-1", "per_day": ""},
+    {"per_minute": "abc", "per_day": ""},
+    {"per_minute": "1.5", "per_day": ""},
+    {"per_minute": "", "per_day": ""},
+])
+def test_an_invalid_rate_limit_form_shows_an_error_and_changes_nothing(fields):
+    store.set_rate_limits(per_minute=7, per_day=9)
+    assert "error" in redirect(post("/__mock/ui/rate-limit", **fields))
+    assert (store.limit_minute(), store.limit_day()) == (7, 9)
+
+
+def test_next_day_from_the_page():
+    store.set_rate_limits(per_day=2)
+    for _ in range(3):
+        store.register_call()
+    assert "msg" in redirect(post("/__mock/ui/rate-limit/next-window", window="day"))
+    assert store.calls_today() == 0
+    assert store.register_call().allowed is True
+
+
+def test_next_minute_from_the_page():
+    store.set_rate_limits(per_minute=2)
+    for _ in range(3):
+        store.register_call()
+    redirect(post("/__mock/ui/rate-limit/next-window", window="minute"))
+    assert store.calls_this_minute() == 0
+
+
+def test_an_unknown_window_from_the_page_is_an_error():
+    assert "error" in redirect(post("/__mock/ui/rate-limit/next-window", window="hour"))
+
+
+def test_the_page_offers_the_rate_limit_controls():
+    html = page()
+    assert 'action="/__mock/ui/rate-limit"' in html
+    assert 'name="per_minute"' in html and 'name="per_day"' in html
+    assert 'action="/__mock/ui/rate-limit/next-window"' in html
+    assert 'value="minute"' in html and 'value="day"' in html
+
+
+def test_script_reads_the_limits():
+    store.set_rate_limits(per_minute=1)
+    refuse_calls(2)
+    rate = client.get("/__mock/status.json").json()["rate_limit"]
+    assert rate["rejected_total"] == 1
+    assert rate["per_minute"] == 1
+
+
+def test_the_new_form_routes_answer_404_when_test_endpoints_are_off(monkeypatch):
+    monkeypatch.setattr(settings, "test_endpoints", False)
+    for route in ("/__mock/ui/switch/ksef-auto", "/__mock/ui/rate-limit", "/__mock/ui/rate-limit/next-window"):
+        assert client.post(route, data={"value": "send"}, follow_redirects=False).status_code == 404

@@ -143,8 +143,11 @@ def test_snapshot_excludes_the_per_minute_window():
     store.register_call()
     assert store.calls_this_minute() == 1
     snap = store.snapshot()
+    # Deliberate change (add-rate-limit-queue-and-ksef-confirmed-delivery): the snapshot also keeps
+    # the day count, the refused-call total and the runtime limits. The minute count stays out.
     assert set(snap) == {"next_document_id", "next_contractor_seq", "documents", "contractors",
-                         "switches", "calls_total"}
+                         "switches", "calls_total", "calls_day", "rejected_total",
+                         "limit_minute", "limit_day"}
     store.restore(snap)
     assert store.calls_total() == 1
     assert store.calls_this_minute() == 0
@@ -191,6 +194,8 @@ def test_listener_is_called_once_per_mutation():
         lambda: store.pdf_not_ready_consume(),
         lambda: store.set_legacy_mode(True),
         lambda: store.register_call(),
+        lambda: store.set_rate_limits(per_minute=5),
+        lambda: store.next_window("day"),
         lambda: store.reset_test_switches(),
         lambda: store.contractors_reset(),
         lambda: store.reset(),
@@ -453,6 +458,79 @@ def test_inspecting_the_file(monkeypatch, tmp_path):
     assert data["next_document_id"] == 2 and data["next_contractor_seq"] == 1
     assert isinstance(data["documents"], list) and data["documents"][0]["ifirma_id"] == 1
     assert "C1" in data["contractors"]
-    assert set(data["switches"]) == {"contractor_create_mode", "pdf_not_ready_remaining", "legacy_mode"}
+    assert set(data["switches"]) == {"contractor_create_mode", "pdf_not_ready_remaining", "legacy_mode",
+                                     "ksef_auto"}
     assert isinstance(data["calls_total"], int) and data["calls_total"] >= 1
     assert state.info()["last_write"] == data["saved_at"]
+
+
+# --------------------------------------------------------------------------- #
+# Day count, refusals and runtime limits survive a restart                     #
+# --------------------------------------------------------------------------- #
+def test_day_count_and_limits_are_kept():
+    for _ in range(40):
+        store.register_call()
+    store.set_rate_limits(per_minute=30, per_day=500)
+    snap = store.snapshot()
+    store.reset_all()
+    store.restore(snap)
+    assert store.calls_today() == 40
+    assert (store.limit_minute(), store.limit_day()) == (30, 500)
+
+
+def test_refused_calls_are_kept():
+    store.set_rate_limits(per_minute=1)
+    store.register_call()
+    store.register_call()
+    snap = store.snapshot()
+    store.reset_all()
+    store.restore(snap)
+    assert store.rejected_total() == 1
+
+
+def test_day_count_from_an_earlier_day_starts_from_zero():
+    snap = store.snapshot()
+    snap["calls_day"] = {"day_key": "2020-01-01", "count": 40}
+    store.restore(snap)
+    assert store.calls_today() == 0
+
+
+def test_state_file_without_the_new_keys_loads():
+    store.restore({"next_document_id": 3, "calls_total": 9, "switches": {}})
+    assert store.calls_total() == 9
+    assert store.calls_today() == 0
+    assert store.rejected_total() == 0
+    assert (store.limit_minute(), store.limit_day()) == (settings.rate_limit, settings.rate_limit_day)
+
+
+def test_runtime_limits_survive_a_restart_through_the_state_file(monkeypatch, tmp_path):
+    use_file(monkeypatch, tmp_path / "state.json")
+    with TestClient(app) as client:
+        client.post("/__mock/rate-limit", json={"per_day": 500})
+    with TestClient(app) as client:
+        assert client.get("/__mock/rate-limit").json()["per_day"] == 500
+
+
+def test_ksef_auto_and_ksef_send_calls_are_kept():
+    store.create("fakturakraj", {})
+    store.count_ksef_send(1)
+    store.count_ksef_send(1)
+    store.set_ksef_auto("send")
+    snap = store.snapshot()
+    store.reset_all()
+    store.restore(snap)
+    assert store.ksef_auto() == "send"
+    assert store.get(1).ksef_send_calls == 2
+
+
+def test_state_file_without_ksef_keys_starts_with_auto_off_and_no_send_calls():
+    store.restore({"next_document_id": 2, "switches": {"legacy_mode": True},
+                   "documents": [{"ifirma_id": 1, "doc_type": "fakturakraj", "number": "1/2026", "payload": {}}]})
+    assert store.ksef_auto() == "off"
+    assert store.get(1).ksef_send_calls == 0
+    assert store.legacy_mode() is True
+
+
+def test_an_unknown_saved_ksef_auto_mode_falls_back_to_off():
+    store.restore({"switches": {"ksef_auto": "sometimes"}})
+    assert store.ksef_auto() == "off"

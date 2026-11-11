@@ -430,7 +430,7 @@ def test_root_answer_names_the_sink(monkeypatch):
     assert body["smtp_port"] == 1025 and body["mailbox"] == "/__mock/mail"
     assert {"service", "version", "user", "base_url", "strict_auth", "documents_issued",
             "status_page"} <= set(body)
-    assert body["version"] == "1.3.0"
+    assert body["version"] == "1.4.0"
 
 
 def test_inline_image_is_not_an_attachment(port):

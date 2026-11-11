@@ -74,15 +74,19 @@ async def lifespan(_app: FastAPI):
             smtp.stop()
 
 
-app = FastAPI(title="iFirma Mock API", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="iFirma Mock API", version="1.4.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
-def _error(kod: int, info: str, http_status: int = 200) -> JSONResponse:
+def _error(
+    kod: int, info: str, http_status: int = 200, headers: dict[str, str] | None = None
+) -> JSONResponse:
     # iFirma reports business errors with HTTP 200 and a non-zero Kod.
-    return JSONResponse({"response": {"Kod": kod, "Informacja": info}}, status_code=http_status)
+    return JSONResponse(
+        {"response": {"Kod": kod, "Informacja": info}}, status_code=http_status, headers=headers
+    )
 
 
 # Authenticated-call accounting lives in the store (feeds abonent/limit.json and the
@@ -90,11 +94,23 @@ def _error(kod: int, info: str, http_status: int = 200) -> JSONResponse:
 LIMIT_GRANTED = 15000
 
 
-def _register_call() -> bool:
-    """Count an authenticated call; return False when the simulated rate limit is exceeded."""
-    this_minute = store.register_call()
-    limit = settings.rate_limit
-    return not (limit > 0 and this_minute > limit)
+def granted_limit() -> int:
+    """The daily limit iFirma reports: the one in force, or the documented 15000 when none is set."""
+    return store.limit_day() or LIMIT_GRANTED
+
+
+RATE_LIMIT_WINDOW_WORDS = {"minute": "limit minutowy", "day": "limit dzienny"}
+
+
+def _rate_limit_answer(verdict: store.CallVerdict) -> JSONResponse:
+    """The refusal iFirma-style: HTTP 429, Retry-After in whole seconds, Kod 100."""
+    window = RATE_LIMIT_WINDOW_WORDS[verdict.window or "minute"]
+    return _error(
+        100,
+        f"Przekroczono limit zapytań ({window}: {verdict.limit})",
+        http_status=429,
+        headers={"Retry-After": str(verdict.retry_after)},
+    )
 
 
 async def _authorized(request: Request, key_name: str, raw_body: bytes) -> JSONResponse | None:
@@ -110,8 +126,9 @@ async def _authorized(request: Request, key_name: str, raw_body: bytes) -> JSONR
             return _error(401, f"Błąd autoryzacji: {result.reason}", http_status=401)
         # Lenient mode: allow the request through but surface the reason in logs.
         print(f"[ifirma-mock] AUTH WARNING ({request.url.path}): {result.reason}")
-    if not _register_call():
-        return _error(100, "Przekroczono limit zapytań")
+    verdict = store.register_call()
+    if not verdict.allowed:
+        return _rate_limit_answer(verdict)
     return None
 
 
@@ -315,6 +332,7 @@ async def create_document(request: Request) -> JSONResponse:
 
     doc_type = "fakturaparagon" if request.url.path.endswith("fakturaparagon.json") else "fakturakraj"
     doc = store.create(doc_type, payload)
+    apply_ksef_auto_send(doc)
 
     # Faithful to the real API: the create response carries only the identifier
     # (as a STRING) and a message — NOT the printable number. The number is
@@ -526,8 +544,8 @@ async def abonent_limit(request: Request) -> JSONResponse:
             "response": {
                 "Kod": 0,
                 "Informacja": "",
-                "LimitWykorzystany": store.calls_total(),
-                "LimitPrzyznany": LIMIT_GRANTED,
+                "LimitWykorzystany": store.calls_today(),
+                "LimitPrzyznany": granted_limit(),
             }
         }
     )
@@ -647,6 +665,9 @@ async def document_detail(doc_type: str, doc_id: str, request: Request) -> JSONR
     node["DodatkoweUwagi"] = doc.dodatkowe_uwagi
     if doc.nazwa_szablonu:
         node["NazwaSzablonu"] = doc.nazwa_szablonu
+    # Since iFirma's 2026-02-01 API change the KSeF state is part of the invoice data.
+    node["KsefStatus"] = doc.ksef_status or ""
+    node["KsefNumer"] = doc.ksef_number or ""
     return JSONResponse({"response": node})
 
 
@@ -662,7 +683,7 @@ KSEF_TYPES = frozenset({
     "fakturaszczegolnyobowiazek", "fakturaoss",
 })
 #: KSeF statuses after which a second send is refused.
-KSEF_SENT_STATES = frozenset({"WYSLANA", "PRZYJETA"})
+KSEF_SENT_STATES = frozenset({"WYSLANA", "ZAPLANOWANA", "PRZYJETA"})
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -708,6 +729,7 @@ async def ksef_send(doc_type: str, ident: str, request: Request) -> JSONResponse
     if doc is None:
         return _error(201, "Nie znaleziono faktury o zadanym identyfikatorze")
 
+    store.count_ksef_send(doc.ifirma_id)
     scheduled = payload["DataWysylki"] is not None
     if doc.ksef_status in KSEF_SENT_STATES:
         return _error(201, "Faktura została już wysłana do KSeF")
@@ -834,6 +856,27 @@ def delete_document(doc_id: str) -> bool:
     return doc_id.isdigit() and store.mark_deleted(int(doc_id))
 
 
+def _generated_ksef_number(doc: store.Document) -> str:
+    digits = "".join(ch for ch in str(doc.contractor_nip or "") if ch.isdigit())
+    nip = digits if len(digits) == 10 else "0000000000"
+    return f"{nip}-{date.today():%Y%m%d}-{secrets.token_hex(6).upper()}-{secrets.token_hex(1).upper()}"
+
+
+def apply_ksef_auto_send(doc: store.Document) -> None:
+    """Behave like an iFirma account that submits new invoices to KSeF itself (switch `ksef-auto`).
+
+    Only a KSeF-capable type with a business buyer (a NIP) is touched: receipts for private buyers
+    never go to KSeF.
+    """
+    mode = store.ksef_auto()
+    if mode == "off" or doc.doc_type not in KSEF_TYPES or not str(doc.contractor_nip or "").strip():
+        return
+    if mode == "accept":
+        store.set_ksef_status(doc.ifirma_id, "PRZYJETA", _generated_ksef_number(doc))
+    else:
+        store.set_ksef_status(doc.ifirma_id, "WYSLANA")
+
+
 def ksef_outcome(doc_id: str, accepted: bool) -> dict[str, Any] | None:
     """Set the KSeF outcome of a stored document; its row, or None when the id is unknown."""
     doc = store.get_active(int(doc_id)) if doc_id.isascii() and doc_id.isdigit() else None
@@ -842,13 +885,7 @@ def ksef_outcome(doc_id: str, accepted: bool) -> dict[str, Any] | None:
     if not accepted:
         store.set_ksef_status(doc.ifirma_id, "ODRZUCONA")
         return _row(doc)
-    digits = "".join(ch for ch in str(doc.contractor_nip or "") if ch.isdigit())
-    nip = digits if len(digits) == 10 else "0000000000"
-    store.set_ksef_status(
-        doc.ifirma_id,
-        "PRZYJETA",
-        f"{nip}-{date.today():%Y%m%d}-{secrets.token_hex(6).upper()}-{secrets.token_hex(1).upper()}",
-    )
+    store.set_ksef_status(doc.ifirma_id, "PRZYJETA", _generated_ksef_number(doc))
     return _row(doc)
 
 
@@ -899,8 +936,89 @@ def set_switch(name: str, value: Any) -> None:
         store.set_legacy_mode(value)
     elif name == "mail-reject":
         store.set_mail_reject(value)
+    elif name == "ksef-auto":
+        store.set_ksef_auto(value)
     else:
         raise ValueError(f"unknown switch {name!r}")
+
+
+RATE_LIMIT_KEYS = {"per_minute": "limit_minute", "per_day": "limit_day"}
+
+
+def rate_limit_data() -> dict[str, Any]:
+    """Limits (effective and environment defaults) and the call counters, for the route and the page."""
+    return {
+        "per_minute": store.limit_minute(),
+        "per_day": store.limit_day(),
+        "defaults": {"per_minute": settings.rate_limit, "per_day": settings.rate_limit_day},
+        "calls_this_minute": store.calls_this_minute(),
+        "calls_today": store.calls_today(),
+        "calls_total": store.calls_total(),
+        "rejected_total": store.rejected_total(),
+        "peak_minute": store.peak_minute(),
+    }
+
+
+def parse_rate_limits(body: Any) -> tuple[dict[str, int], str | None]:
+    """Validate a rate-limit body: known keys only, each a non-negative integer, at least one."""
+    if not isinstance(body, dict) or not body:
+        return {}, "body must name per_minute and/or per_day"
+    unknown = sorted(set(body) - set(RATE_LIMIT_KEYS))
+    if unknown:
+        return {}, f"unknown key {unknown[0]!r}; use per_minute and/or per_day"
+    for key, value in body.items():
+        if type(value) is not int or value < 0:
+            return {}, f"{key} must be a non-negative integer"
+    return dict(body), None
+
+
+@app.get("/__mock/rate-limit")
+async def mock_get_rate_limit() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse(rate_limit_data())
+
+
+@app.post("/__mock/rate-limit")
+async def mock_set_rate_limit(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    limits, problem = parse_rate_limits(_parse_body(await request.body()))
+    if problem is not None:
+        return JSONResponse({"detail": problem}, status_code=422)
+    store.set_rate_limits(per_minute=limits.get("per_minute"), per_day=limits.get("per_day"))
+    return JSONResponse(rate_limit_data())
+
+
+@app.post("/__mock/rate-limit/next-window")
+async def mock_rate_limit_next_window(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    window = body.get("window") if isinstance(body, dict) else None
+    if window not in store.RATE_WINDOWS:
+        return JSONResponse({"detail": "window must be 'minute' or 'day'"}, status_code=422)
+    store.next_window(window)
+    return JSONResponse(rate_limit_data())
+
+
+@app.get("/__mock/ksef-auto")
+async def mock_get_ksef_auto() -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    return JSONResponse({"mode": store.ksef_auto()})
+
+
+@app.post("/__mock/ksef-auto")
+async def mock_set_ksef_auto(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    body = _parse_body(await request.body())
+    mode = body.get("mode") if isinstance(body, dict) and set(body) == {"mode"} else None
+    if mode not in store.KSEF_AUTO_MODES:
+        return JSONResponse({"detail": "mode must be off, send or accept"}, status_code=422)
+    set_switch("ksef-auto", mode)
+    return JSONResponse({"mode": store.ksef_auto()})
 
 
 @app.post("/__mock/contractor-mode")
@@ -1059,6 +1177,7 @@ def status_data() -> dict[str, Any]:
         row["deleted"] = doc.deleted
         row["created_by"] = doc.created_by
         row["NazwaSzablonu"] = doc.nazwa_szablonu
+        row["ksef_send_calls"] = doc.ksef_send_calls
         row["statuses"] = sorted(doc.statuses())
         documents.append(row)
     return {
@@ -1069,6 +1188,7 @@ def status_data() -> dict[str, Any]:
             "base_url": settings.base_url,
             "strict_auth": settings.strict_auth,
             "rate_limit": settings.rate_limit,
+            "rate_limit_day": settings.rate_limit_day,
             "strict_list_window": settings.strict_list_window,
             "test_endpoints": settings.test_endpoints,
             "smtp_port": settings.smtp_port,
@@ -1077,13 +1197,18 @@ def status_data() -> dict[str, Any]:
         "counters": {
             "calls_total": store.calls_total(),
             "calls_this_minute": store.calls_this_minute(),
-            "limit_granted": LIMIT_GRANTED,
+            "calls_today": store.calls_today(),
+            "rejected_total": store.rejected_total(),
+            "peak_minute": store.peak_minute(),
+            "limit_granted": granted_limit(),
         },
+        "rate_limit": rate_limit_data(),
         "switches": {
             "contractor_mode": store.contractor_create_mode(),
             "pdf_not_ready_remaining": store.pdf_not_ready_remaining(),
             "legacy_mode": store.legacy_mode(),
             "mail_reject": store.mail_reject(),
+            "ksef_auto": store.ksef_auto(),
         },
         "documents": documents,
         "contractors": store.all_contractors(),
@@ -1170,10 +1295,44 @@ async def mock_ui_switch(name: str, request: Request) -> Response:
         if raw.lower() not in ("true", "false"):
             return _back(error="mail-reject must be true or false")
         value = raw.lower() == "true"
+    elif name == "ksef-auto":
+        if raw not in store.KSEF_AUTO_MODES:
+            return _back(error="ksef-auto must be off, send or accept")
+        value = raw
     else:
         return _back(error=f"Unknown switch {name}")
     set_switch(name, value)
     return _back(msg=f"{name} set to {raw.lower() if name in ('legacy-mode', 'mail-reject') else raw}.")
+
+
+@app.post("/__mock/ui/rate-limit", response_model=None)
+async def mock_ui_rate_limit(request: Request) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    form = await ui.read_form(request)
+    limits: dict[str, int] = {}
+    for key in RATE_LIMIT_KEYS:
+        raw = form.get(key, "").strip()
+        if not raw:
+            continue  # a blank field leaves that limit as it is
+        if not raw.isascii() or not raw.isdigit():
+            return _back(error=f"{key} must be a non-negative integer")
+        limits[key] = int(raw)
+    if not limits:
+        return _back(error="Give per_minute and/or per_day")
+    store.set_rate_limits(per_minute=limits.get("per_minute"), per_day=limits.get("per_day"))
+    return _back(msg="Rate limits set: " + ", ".join(f"{k} {v}" for k, v in limits.items()) + ".")
+
+
+@app.post("/__mock/ui/rate-limit/next-window", response_model=None)
+async def mock_ui_rate_limit_next_window(request: Request) -> Response:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    window = (await ui.read_form(request)).get("window", "")
+    if window not in store.RATE_WINDOWS:
+        return _back(error="window must be minute or day")
+    store.next_window(window)
+    return _back(msg=f"Next {window}: the {window} count is cleared.")
 
 
 @app.post("/__mock/ui/documents/{doc_id}/{action}", response_model=None)

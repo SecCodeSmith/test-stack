@@ -56,6 +56,13 @@ async def read_form(request: Request) -> dict[str, str]:
         return {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
 
 
+def _limit_with_default(value: int, default: int) -> str:
+    def word(number: int) -> str:
+        return str(number) if number else "off"
+
+    return f"{word(value)} (environment default {word(default)})"
+
+
 def _kv(items: list[tuple[str, Any]]) -> str:
     rows = "".join(f"<dt>{_e(k)}</dt><dd>{_e(v)}</dd>" for k, v in items)
     return f"<dl>{rows}</dl>"
@@ -81,7 +88,7 @@ def _switch_form(name: str, label: str, current: str, control: str) -> str:
     )
 
 
-def _switches(sw: dict[str, Any]) -> str:
+def _switches(sw: dict[str, Any], rate: dict[str, Any]) -> str:
     mode = sw["contractor_mode"]
     options = "".join(
         f'<option value="{m}"{" selected" if m == mode else ""}>{m}</option>' for m in ("normal", "rename")
@@ -89,6 +96,10 @@ def _switches(sw: dict[str, Any]) -> str:
     legacy = "true" if sw["legacy_mode"] else "false"
     legacy_options = "".join(
         f'<option value="{v}"{" selected" if v == legacy else ""}>{v}</option>' for v in ("true", "false")
+    )
+    auto_options = "".join(
+        f'<option value="{m}"{" selected" if m == sw["ksef_auto"] else ""}>{m}</option>'
+        for m in ("off", "send", "accept")
     )
     return (
         _switch_form("contractor-mode", "Contractor create mode", mode,
@@ -99,7 +110,32 @@ def _switches(sw: dict[str, Any]) -> str:
                        f'value="{_e(sw["pdf_not_ready_remaining"])}"></label>')
         + _switch_form("legacy-mode", "Legacy mode", legacy,
                        f'<label>value <select name="value">{legacy_options}</select></label>')
+        + _switch_form("ksef-auto", "KSeF auto-send", sw["ksef_auto"],
+                       f'<label>value <select name="value">{auto_options}</select></label>')
+        + _rate_limit_forms(rate)
     )
+
+
+def _rate_limit_forms(rate: dict[str, Any]) -> str:
+    def current(value: int) -> str:
+        return str(value) if value else "off"
+
+    limits = (
+        '<form method="post" action="/__mock/ui/rate-limit"><fieldset><legend>Rate limits</legend>'
+        f"<p>Current: <strong>{_e(current(rate['per_minute']))}</strong> per minute, "
+        f"<strong>{_e(current(rate['per_day']))}</strong> per day (0 = off, blank = unchanged)</p>"
+        '<label>per minute <input type="number" name="per_minute" min="0"></label>'
+        '<label>per day <input type="number" name="per_day" min="0"></label>'
+        '<button type="submit">Set</button></fieldset></form>'
+    )
+    windows = (
+        '<form method="post" action="/__mock/ui/rate-limit/next-window"><fieldset>'
+        "<legend>Next window</legend>"
+        '<button type="submit" name="window" value="minute">Next minute</button> '
+        '<button type="submit" name="window" value="day">Next day</button>'
+        "</fieldset></form>"
+    )
+    return limits + windows
 
 
 def _seed_form() -> str:
@@ -134,7 +170,8 @@ def _documents(docs: list[dict[str, Any]]) -> str:
     if not docs:
         return "<p>No documents stored.</p>"
     head = ("<tr><th>Id</th><th>Number</th><th>Type</th><th>Contractor</th><th>NIP</th><th>Issued</th>"
-            "<th>Due</th><th>Gross</th><th>Paid</th><th>Template</th><th>Buckets</th><th>KSeF</th><th>Created by</th>"
+            "<th>Due</th><th>Gross</th><th>Paid</th><th>Template</th><th>Buckets</th><th>KSeF</th>"
+            "<th>KSeF send calls</th><th>Created by</th>"
             "<th>Sent</th><th>Actions</th></tr>")
     rows = []
     for d in docs:
@@ -146,7 +183,8 @@ def _documents(docs: list[dict[str, Any]]) -> str:
             f"<td>{_e(d['KontrahentNazwa'])}</td><td>{_e(d['NIPKontrahenta'])}</td>"
             f"<td>{_e(d['DataWystawienia'])}</td><td>{_e(d['TerminPlatnosci'])}</td>"
             f"<td>{d['Brutto']:.2f}</td><td>{d['Zaplacono']:.2f}</td><td>{_e(d.get('NazwaSzablonu', ''))}</td>"
-            f"<td>{_e(', '.join(d['statuses']))}</td><td>{_e(ksef)}</td><td>{_e(d['created_by'])}</td>"
+            f"<td>{_e(', '.join(d['statuses']))}</td><td>{_e(ksef)}</td><td>{_e(d['ksef_send_calls'])}</td>"
+            f"<td>{_e(d['created_by'])}</td>"
             f"<td>{_e(d['CzyWyslano'])}</td><td>{_doc_buttons(d)}</td></tr>"
         )
     return f"<table>{head}{''.join(rows)}</table>"
@@ -194,6 +232,7 @@ def _mail(items: list[dict[str, Any]], port: int, reject: bool) -> str:
 def render_page(data: dict[str, Any], msg: str | None = None, error: str | None = None) -> str:
     s = data["settings"]
     c = data["counters"]
+    rate = data["rate_limit"]
     flash = ""
     if error:
         flash += f'<div class="flash error" role="alert">{_e(error)}</div>'
@@ -208,16 +247,19 @@ def render_page(data: dict[str, Any], msg: str | None = None, error: str | None 
         "<h2>Settings</h2>"
         + _kv([
             ("User", s["user"]), ("Base URL", s["base_url"]), ("Strict auth", s["strict_auth"]),
-            ("Rate limit", s["rate_limit"]), ("Strict list window", s["strict_list_window"]),
+            ("Rate limit per minute", _limit_with_default(rate["per_minute"], rate["defaults"]["per_minute"])),
+            ("Rate limit per day", _limit_with_default(rate["per_day"], rate["defaults"]["per_day"])),
+            ("Strict list window", s["strict_list_window"]),
             ("Test endpoints", s["test_endpoints"]),
         ])
         + "<h2>Persistence</h2>" + _persistence(data["persistence"])
         + "<h2>Counters</h2>"
         + _kv([
             ("Calls total", c["calls_total"]), ("Calls this minute", c["calls_this_minute"]),
-            ("Limit granted", c["limit_granted"]),
+            ("Calls today", c["calls_today"]), ("Refused calls", c["rejected_total"]),
+            ("Busiest minute", c["peak_minute"]), ("Limit granted", c["limit_granted"]),
         ])
-        + "<h2>Switches</h2>" + _switches(data["switches"])
+        + "<h2>Switches</h2>" + _switches(data["switches"], rate)
         + "<h2>Seed</h2>" + _seed_form()
         + "<h2>Documents</h2>" + _documents(data["documents"])
         + "<h2>Contractors</h2>" + _contractors(data["contractors"])
