@@ -147,7 +147,7 @@ def test_snapshot_excludes_the_per_minute_window():
     # the day count, the refused-call total and the runtime limits. The minute count stays out.
     assert set(snap) == {"next_document_id", "next_contractor_seq", "documents", "contractors",
                          "switches", "calls_total", "calls_day", "rejected_total",
-                         "limit_minute", "limit_day"}
+                         "limit_minute", "limit_day", "monthly_created", "monthly_override"}
     store.restore(snap)
     assert store.calls_total() == 1
     assert store.calls_this_minute() == 0
@@ -290,18 +290,18 @@ def test_contractors_and_switches_are_kept(monkeypatch, tmp_path):
         assert client.get("/__mock/contractor-mode").json() == {"create": "rename"}
 
 
-def test_served_call_counter_continues(monkeypatch, tmp_path):
+def test_monthly_document_count_continues_after_a_restart(monkeypatch, tmp_path):
     use_file(monkeypatch, tmp_path / "state.json")
     with TestClient(app) as client:
+        create_invoice(client)
         for _ in range(3):
             listing(client)
-        first = get_json(client, "/iapi/abonent/limit.json", key="abonent")
-        used_before = first["LimitWykorzystany"]
-    assert used_before == 4
+        used_before = get_json(client, "/iapi/abonent/limit.json", key="abonent")["LimitWykorzystany"]
+    assert used_before == 1
 
     with TestClient(app) as client:
         again = get_json(client, "/iapi/abonent/limit.json", key="abonent")
-        assert again["LimitWykorzystany"] == used_before + 1
+        assert again["LimitWykorzystany"] == used_before
 
 
 def test_payments_and_deletions_are_kept(monkeypatch, tmp_path):
@@ -409,8 +409,8 @@ def test_clean_start_discards_the_stored_state(monkeypatch, tmp_path):
         assert listing(client) == []
         assert get_json(client, "/iapi/kontrahenci/id/OLD1.json")["Kod"] != 0
         assert client.get("/__mock/legacy-mode").json() == {"enabled": False}
-        # the call counter was zero at start: only the two calls above plus this one are counted
-        assert get_json(client, "/iapi/abonent/limit.json", key="abonent")["LimitWykorzystany"] == 3
+        # the stored invoice was discarded with the state, so this month's document count starts at 0
+        assert get_json(client, "/iapi/abonent/limit.json", key="abonent")["LimitWykorzystany"] == 0
         on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk["documents"] == [] and on_disk["contractors"] == {}
     assert on_disk["switches"]["legacy_mode"] is False

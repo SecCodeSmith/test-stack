@@ -347,20 +347,21 @@ def abonent_key(monkeypatch):
     monkeypatch.setitem(settings.keys, "abonent", "2" * 64)
 
 
-def test_daily_usage_on_the_limit_endpoint(clock, abonent_key):
+def test_monthly_usage_on_the_limit_endpoint(clock, abonent_key):
     for _ in range(40):
         store.register_call()
     answer = abonent_limit()
-    assert (answer["LimitWykorzystany"], answer["LimitPrzyznany"]) == (41, 15000)
+    assert (answer["LimitWykorzystany"], answer["LimitPrzyznany"]) == (0, 1000)
 
 
-def test_the_limit_endpoint_reports_the_day_limit_in_force(clock, abonent_key):
+def test_the_limit_endpoint_reports_the_monthly_grant_whatever_the_day_limit(clock, abonent_key):
     store.set_rate_limits(per_day=500)
-    assert abonent_limit()["LimitPrzyznany"] == 500
+    assert abonent_limit()["LimitPrzyznany"] == 1000
 
 
-def test_the_limit_endpoint_counts_today_and_not_the_all_time_total(clock, abonent_key):
+def test_the_limit_endpoint_counts_documents_of_the_month_not_the_call_total(clock, abonent_key):
     for _ in range(5):
         store.register_call()
+    assert abonent_limit()["LimitWykorzystany"] == 0
     clock[0] = local_epoch(9, 0, 0, day=11)
-    assert abonent_limit()["LimitWykorzystany"] == 1
+    assert abonent_limit()["LimitWykorzystany"] == 0

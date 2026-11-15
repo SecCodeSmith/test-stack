@@ -16,7 +16,7 @@ the same authentication scheme, so the module's HMAC signing is exercised for re
   GET  /iapi/{doc_type}/{id}.json           document detail  (key: faktura)
   POST /iapi/{doc_type}/send/{id}.json      e-mail document  (key: faktura)
   POST /iapi/{doc_type}/ksef/send/{id}.json send invoice to KSeF (key: faktura)
-  GET  /iapi/abonent/limit.json             API usage limit  (key: abonent)
+  GET  /iapi/abonent/limit.json             monthly API limit (key: abonent)
   GET  /iapi/kontrahenci/id/{id}.json       contractor by id (key: faktura)
   POST /iapi/kontrahenci.json               create contractor (key: faktura)
   PUT  /iapi/kontrahenci/{id}.json          replace contractor (key: faktura)
@@ -25,6 +25,7 @@ the same authentication scheme, so the module's HMAC signing is exercised for re
 Test-only helpers (no HMAC, guarded by IFIRMA_MOCK_TEST_ENDPOINTS):
   POST /__mock/documents, DELETE /__mock/documents/{id}, POST /__mock/contractors,
   POST /__mock/ksef/accept/{id}, POST /__mock/ksef/reject/{id}, POST /__mock/reset,
+  POST /__mock/monthly-limit (granted: int>=1|null, used: int>=0|null; null clears an override),
   POST|GET /__mock/contractor-mode (create: normal|rename), POST|GET /__mock/pdf-not-ready,
   POST|GET /__mock/legacy-mode (enabled: true|false),
   GET /__mock/mail, GET /__mock/mail/{id}[/raw|/attachments/{n}], DELETE /__mock/mail and
@@ -332,6 +333,7 @@ async def create_document(request: Request) -> JSONResponse:
 
     doc_type = "fakturaparagon" if request.url.path.endswith("fakturaparagon.json") else "fakturakraj"
     doc = store.create(doc_type, payload)
+    store.record_api_document()
     apply_ksef_auto_send(doc)
 
     # Faithful to the real API: the create response carries only the identifier
@@ -539,13 +541,14 @@ async def abonent_limit(request: Request) -> JSONResponse:
     auth_err = await _authorized(request, "abonent", b"")
     if auth_err is not None:
         return auth_err
+    monthly = monthly_limit_data()
     return JSONResponse(
         {
             "response": {
                 "Kod": 0,
                 "Informacja": "",
-                "LimitWykorzystany": store.calls_today(),
-                "LimitPrzyznany": granted_limit(),
+                "LimitWykorzystany": monthly["used"],
+                "LimitPrzyznany": monthly["granted"],
             }
         }
     )
@@ -944,6 +947,32 @@ def set_switch(name: str, value: Any) -> None:
 
 RATE_LIMIT_KEYS = {"per_minute": "limit_minute", "per_day": "limit_day"}
 
+MONTHLY_LIMIT_MINIMUM = {"granted": 1, "used": 0}
+
+
+def monthly_limit_data() -> dict[str, int]:
+    """The figures abonent/limit.json answers now: documents created this month, and the grant."""
+    overrides = store.monthly_overrides()
+    return {
+        "used": overrides.get("used", store.monthly_created()),
+        "granted": overrides.get("granted", settings.monthly_limit),
+    }
+
+
+def parse_monthly_limit(body: Any) -> tuple[dict[str, int | None], str | None]:
+    """Validate a monthly-limit body: known keys only, each an int above its minimum or null, at least one key."""
+    if not isinstance(body, dict) or not body:
+        return {}, "body must name granted and/or used"
+    unknown = sorted(set(body) - set(MONTHLY_LIMIT_MINIMUM))
+    if unknown:
+        return {}, f"unknown key {unknown[0]!r}; use granted and/or used"
+    for key, value in body.items():
+        if value is None:
+            continue
+        if type(value) is not int or value < MONTHLY_LIMIT_MINIMUM[key]:
+            return {}, f"{key} must be an integer of at least {MONTHLY_LIMIT_MINIMUM[key]}, or null"
+    return dict(body), None
+
 
 def rate_limit_data() -> dict[str, Any]:
     """Limits (effective and environment defaults) and the call counters, for the route and the page."""
@@ -988,6 +1017,17 @@ async def mock_set_rate_limit(request: Request) -> JSONResponse:
         return JSONResponse({"detail": problem}, status_code=422)
     store.set_rate_limits(per_minute=limits.get("per_minute"), per_day=limits.get("per_day"))
     return JSONResponse(rate_limit_data())
+
+
+@app.post("/__mock/monthly-limit")
+async def mock_set_monthly_limit(request: Request) -> JSONResponse:
+    if (off := _test_endpoints_disabled()) is not None:
+        return off
+    changes, problem = parse_monthly_limit(_parse_body(await request.body()))
+    if problem is not None:
+        return JSONResponse({"detail": problem}, status_code=400)
+    store.set_monthly_overrides(changes)
+    return JSONResponse(monthly_limit_data())
 
 
 @app.post("/__mock/rate-limit/next-window")
@@ -1203,6 +1243,7 @@ def status_data() -> dict[str, Any]:
             "limit_granted": granted_limit(),
         },
         "rate_limit": rate_limit_data(),
+        "monthly_limit": monthly_limit_data(),
         "switches": {
             "contractor_mode": store.contractor_create_mode(),
             "pdf_not_ready_remaining": store.pdf_not_ready_remaining(),

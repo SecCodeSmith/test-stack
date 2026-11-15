@@ -45,9 +45,17 @@ _peak_minute = 0
 _limit_minute: int | None = None
 _limit_day: int | None = None
 
+#: Documents created through the API in the current calendar month (feeds the monthly figure of
+#: abonent/limit.json). Seeded documents are not counted.
+_monthly_month = ""
+_monthly_created = 0
+#: Test overrides set through /__mock/monthly-limit, keyed by "granted" and "used".
+_monthly_override: dict[str, int] = {}
+
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_DAY = 86400
 RATE_WINDOWS = ("minute", "day")
+MONTHLY_OVERRIDE_FIELDS = ("granted", "used")
 
 RODZAJ_MAP = {
     "fakturaparagon": "prz_faktura_paragon",
@@ -528,6 +536,10 @@ def _day_key(now: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(now))
 
 
+def _month_key(now: float) -> str:
+    return time.strftime("%Y-%m", time.localtime(now))
+
+
 def _seconds_left_in_minute(now: float) -> int:
     return max(1, math.ceil(SECONDS_PER_MINUTE - now % SECONDS_PER_MINUTE))
 
@@ -617,6 +629,42 @@ def rejected_total() -> int:
 def peak_minute() -> int:
     with _lock:
         return _peak_minute
+
+
+def record_api_document() -> None:
+    """Count a document created through the API in the current month (restarts at 0 each month)."""
+    global _monthly_month, _monthly_created
+    with _lock:
+        month = _month_key(_now())
+        if _monthly_month != month:
+            _monthly_month = month
+            _monthly_created = 0
+        _monthly_created += 1
+        _changed()
+
+
+def monthly_created() -> int:
+    with _lock:
+        if _monthly_month != _month_key(_now()):
+            return 0
+        return _monthly_created
+
+
+def monthly_overrides() -> dict[str, int]:
+    """The test overrides in force ("granted" and/or "used"); empty when none is set."""
+    with _lock:
+        return dict(_monthly_override)
+
+
+def set_monthly_overrides(changes: dict[str, int | None]) -> None:
+    """Apply overrides by field: an int sets it, None clears it, a field left out keeps its value."""
+    with _lock:
+        for field_name, value in changes.items():
+            if value is None:
+                _monthly_override.pop(field_name, None)
+            else:
+                _monthly_override[field_name] = value
+        _changed()
 
 
 def set_rate_limits(per_minute: int | None = None, per_day: int | None = None) -> None:
@@ -712,6 +760,7 @@ def _clear_unlocked(keep_mail: bool = False) -> None:
     global _next_document_id, _next_contractor_seq, _calls_total, _calls_minute, _calls_minute_count
     global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode, _ksef_auto
     global _calls_day_key, _calls_day, _rejected_total, _peak_minute, _limit_minute, _limit_day
+    global _monthly_month, _monthly_created
     if not keep_mail:
         _clear_mail_unlocked()
     _documents.clear()
@@ -731,6 +780,9 @@ def _clear_unlocked(keep_mail: bool = False) -> None:
     _peak_minute = 0
     _limit_minute = None
     _limit_day = None
+    _monthly_month = ""
+    _monthly_created = 0
+    _monthly_override.clear()
 
 
 def reset_all() -> None:
@@ -770,6 +822,8 @@ def _snapshot_unlocked() -> dict[str, Any]:
         "rejected_total": _rejected_total,
         "limit_minute": _limit_minute,
         "limit_day": _limit_day,
+        "monthly_created": {"month": _monthly_month, "created": _monthly_created},
+        "monthly_override": dict(_monthly_override),
     }
 
 
@@ -788,6 +842,7 @@ def restore(data: dict[str, Any]) -> None:
     global _next_document_id, _next_contractor_seq, _calls_total
     global _contractor_create_mode, _pdf_not_ready_remaining, _legacy_mode, _ksef_auto
     global _calls_day_key, _calls_day, _rejected_total, _limit_minute, _limit_day
+    global _monthly_month, _monthly_created
     known = {f.name for f in dataclasses.fields(Document)}
     documents: dict[int, Document] = {}
     for raw in data.get("documents") or []:
@@ -814,6 +869,14 @@ def restore(data: dict[str, Any]) -> None:
     rejected = max(0, int(data.get("rejected_total") or 0))
     saved_minute = data.get("limit_minute")
     saved_day = data.get("limit_day")
+    monthly = data.get("monthly_created") or {}
+    monthly_month = str(monthly.get("month") or "")
+    monthly_count = max(0, int(monthly.get("created") or 0)) if monthly_month == _month_key(_now()) else 0
+    saved_override = data.get("monthly_override") or {}
+    overrides = {
+        field_name: max(0, int(saved_override[field_name]))
+        for field_name in MONTHLY_OVERRIDE_FIELDS if saved_override.get(field_name) is not None
+    }
     with _lock:
         _clear_unlocked(keep_mail=True)
         _documents.update(documents)
@@ -830,6 +893,9 @@ def restore(data: dict[str, Any]) -> None:
         _rejected_total = rejected
         _limit_minute = max(0, int(saved_minute)) if saved_minute is not None else None
         _limit_day = max(0, int(saved_day)) if saved_day is not None else None
+        _monthly_month = monthly_month if monthly_count else ""
+        _monthly_created = monthly_count
+        _monthly_override.update(overrides)
         _changed()
 
 

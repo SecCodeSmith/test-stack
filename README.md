@@ -46,7 +46,7 @@ behaviour:
 | Document detail | `GET /iapi/{type}/{id}.json` | `faktura` | `{"response":{"Kod":0,"Identyfikator":"…","PelnyNumer":"…","Zaplacono":…,"Uwagi":"…","DodatkoweUwagi":{…},"KsefStatus":"…","KsefNumer":"…", …}}` (the two KSeF fields are empty strings when the document has no KSeF state); unknown/deleted id → Kod 404 envelope (HTTP 200) |
 | Send by e-mail | `POST /iapi/{type}/send/{id}.json` body `Tekst`, `SkrzynkaEmailOdbiorcy`, … | `faktura` | Kod 0 "Wiadomość została wysłana." for `fakturakraj`, `fakturawysylka`, `fakturaproformakraj`, … ; `fakturaparagon` → Kod 200 (not available); `Tekst` > 1000 → Kod 201 |
 | Send invoice to KSeF | `POST /iapi/{type}/ksef/send/{id}.json` body `{"DataWysylki": null}` (null = send now, `YYYY-MM-DD` = scheduled); `{type}` may be `fakturakraj/korekta`; `{id}` = document id or number with `_` for `/` (e.g. `314_2026`) | `faktura` | Documented request. Response and message wording are the mock's own, unverified live: Kod 0 "Faktura została wysłana do KSeF." (status `WYSLANA`, or `ZAPLANOWANA` when a date is given; `KsefNumer` stays empty); unsupported type → Kod 200; missing key or invalid `DataWysylki` → Kod 201 `DataWysylki: nieprawidłowa wartość`; unknown id → Kod 201 "Nie znaleziono faktury o zadanym identyfikatorze"; already `WYSLANA`, `ZAPLANOWANA` or `PRZYJETA` → Kod 201 "Faktura została już wysłana do KSeF". Every call that names a stored document is counted per document (`ksef_send_calls`), refused or not |
-| API usage limit | `GET /iapi/abonent/limit.json` | `abonent` | `{"response":{"Kod":0,"LimitWykorzystany":<calls served today>,"LimitPrzyznany":<day limit, 15000 when none is set>}}` |
+| Monthly API limit | `GET /iapi/abonent/limit.json` | `abonent` | `{"response":{"Kod":0,"LimitWykorzystany":<documents created through the API this calendar month>,"LimitPrzyznany":<monthly grant, `IFIRMA_MOCK_MONTHLY_LIMIT` (1000) unless overridden>}}` |
 | Contractor by id | `GET /iapi/kontrahenci/id/{identifier}.json` | `faktura` | found: `{"response":{"Kod":0,"Informacja":"","Wynik":[<contractor>]}}`; not found: Kod 208 "Nie znaleziono kontrahenta" |
 | Create contractor | `POST /iapi/kontrahenci.json` | `faktura` | Kod 0 "Dodano kontrahenta" with `Wynik` = identifier; missing `Nazwa`/`KodPocztowy`/`Miejscowosc` → Kod 201 `Validation errors: …`; identifier > 15 chars or already existing → Kod 201 |
 | Replace contractor | `PUT /iapi/kontrahenci/{identifier}.json` | `faktura` | Kod 0 "Zaktualizowano kontrahenta" (full replace, identifier kept); unknown → Kod 208 |
@@ -359,6 +359,7 @@ Test-only routes (no HMAC, `IFIRMA_MOCK_TEST_ENDPOINTS`; restored by `/__mock/re
 | `GET /__mock/rate-limit` | `per_minute`, `per_day` (in force), `defaults` (from the environment), `calls_this_minute`, `calls_today`, `calls_total`, `rejected_total` (refused calls), `peak_minute` (most calls in any one calendar minute since the last reset) |
 | `POST /__mock/rate-limit` | body `{"per_minute": n, "per_day": m}`, either key, non-negative integers; anything else is 422 and changes nothing |
 | `POST /__mock/rate-limit/next-window` | body `{"window": "minute"}` or `"day"` clears that window's count as if it had ended (total and the other window untouched); another value is 422 |
+| `POST /__mock/monthly-limit` | body `{"granted": n, "used": m}`, either key; `n` an integer of at least 1, `m` at least 0, or `null` to clear that override (a key left out keeps its value); anything else is 400 and changes nothing. Answers `{"used", "granted"}` as `abonent/limit.json` now reports them. Not an API call |
 
 ```bash
 # provoke a refusal after 5 calls in a minute, look at it, and move on without waiting
@@ -378,8 +379,9 @@ The limits, the day count and the refused-call total survive a restart (the minu
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `IFIRMA_MOCK_RATE_LIMIT` | `0` (off); compose: `100` | When `N > 0`, the (N+1)th authenticated `/iapi/*` call within a calendar minute is refused with HTTP 429, `Retry-After` and Kod 100 "Przekroczono limit zapytań (limit minutowy: N)" (see "Rate limits") |
-| `IFIRMA_MOCK_RATE_LIMIT_DAY` | `0` (off); compose: `15000` | The same per calendar day ("limit dzienny"); also the `LimitPrzyznany` of `abonent/limit.json` (15000 when off) |
+| `IFIRMA_MOCK_RATE_LIMIT_DAY` | `0` (off); compose: `15000` | The same per calendar day ("limit dzienny"); not reported by `abonent/limit.json`, which answers the monthly limit |
 | `TZ` | image default (UTC); compose: `Europe/Warsaw` | Zone of the mock's calendar day (and of its log timestamps) |
+| `IFIRMA_MOCK_MONTHLY_LIMIT` | `1000` | The `LimitPrzyznany` of `abonent/limit.json`. Real iFirma grants each account its own monthly limit on request, so set it to your account's figure. `POST /__mock/monthly-limit` changes it at runtime, e.g. to simulate iFirma raising the grant mid-month. A value that is not a whole number of at least 1 falls back to 1000 |
 | `IFIRMA_MOCK_TEST_ENDPOINTS` | `true` | Enables `/__mock/*`; when `false` they return HTTP 404 |
 | `IFIRMA_MOCK_STRICT_LIST_WINDOW` | `false` | When `true`, `faktury.json` without `dataDo` uses the real API's `dataOd + 30 days` window (off by default so a plain `dataOd=2020-01-01` call still lists new documents) |
 | `IFIRMA_MOCK_KEY_ABONENT` | empty | Key for `abonent/limit.json`; empty means that endpoint always answers 401 |
