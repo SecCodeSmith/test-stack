@@ -420,8 +420,8 @@ def test_mailbox_reads_are_not_api_traffic(port):
     client.get("/__mock/mail/reject")
     client.post("/__mock/mail/reject", json={"enabled": False})
     after = used()
-    assert after == before + 1  # only the second limit.json call itself counts
-    assert store.calls_total() == 2
+    assert after == before == 0  # no document was created, so the monthly count stays put
+    assert store.calls_total() == 2  # both limit.json calls are API calls; mailbox reads are not
 
 
 def test_root_answer_names_the_sink(monkeypatch):

@@ -263,12 +263,12 @@ def test_send_unknown_id_and_long_text():
 
 
 # ----------------------------- limit / rate limit --------------------------- #
-def test_limit_counts_calls():
+def test_limit_does_not_count_list_calls():
     first = get_json("/iapi/abonent/limit.json", key="abonent")
     get_json("/iapi/faktury.json", "dataOd=2020-01-01")
     second = get_json("/iapi/abonent/limit.json", key="abonent")
-    assert first["Kod"] == 0 and first["LimitPrzyznany"] == 15000
-    assert second["LimitWykorzystany"] == first["LimitWykorzystany"] + 2
+    assert first["Kod"] == 0 and first["LimitPrzyznany"] == 1000
+    assert second["LimitWykorzystany"] == first["LimitWykorzystany"] == 0
 
 
 def test_limit_without_abonent_key_is_rejected():
@@ -341,8 +341,7 @@ def test_reset_clears_store_and_counters():
     get_json("/iapi/faktury.json", "dataOd=2020-01-01")
     assert client.post("/__mock/reset").status_code == 200
     assert listing() == []
-    # the listing call above is the only counted call after reset
-    assert get_json("/iapi/abonent/limit.json", key="abonent")["LimitWykorzystany"] == 2
+    assert get_json("/iapi/abonent/limit.json", key="abonent")["LimitWykorzystany"] == 0
 
 
 def test_test_endpoints_disabled_return_404():

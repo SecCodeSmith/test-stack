@@ -285,7 +285,7 @@ def test_script_reads_the_state():
     # Deliberate change (add-rate-limit-queue-and-ksef-confirmed-delivery): the twin also carries the
     # day limit, the new counters, the `rate_limit` object and the KSeF auto-send switch.
     assert set(data) == {"service", "version", "settings", "persistence", "counters", "switches",
-                         "documents", "contractors", "mail", "rate_limit"}
+                         "documents", "contractors", "mail", "rate_limit", "monthly_limit"}
     assert data["version"] == app.version
     assert set(data["settings"]) == {"user", "base_url", "strict_auth", "rate_limit", "rate_limit_day",
                                      "strict_list_window", "test_endpoints", "smtp_port"}
@@ -309,13 +309,13 @@ def test_watching_the_page_while_testing(monkeypatch):
         resp = client.get(path, headers={"Authentication": sign(path, "abonent", "")})
         return resp.json()["response"]["LimitWykorzystany"]
 
-    assert limit_used() == 1
+    assert limit_used() == 0
     for _ in range(5):
         client.get("/__mock/status")
         client.get("/__mock/status.json")
     resp = client.get(path, headers={"Authentication": sign(path, "abonent", "")})
     assert resp.json()["response"]["Kod"] == 0
-    assert resp.json()["response"]["LimitWykorzystany"] == 2
+    assert resp.json()["response"]["LimitWykorzystany"] == 0
     assert store.calls_total() == 2
 
 
