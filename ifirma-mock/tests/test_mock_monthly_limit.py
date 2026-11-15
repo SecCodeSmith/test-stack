@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from app import store
 from app.config import settings
-from app.main import MONTHLY_LIMIT_GRANTED, app
+from app.main import app
 from tests.test_mock_extensions import sign
 
 http = TestClient(app)
@@ -80,7 +80,6 @@ def set_monthly(body) -> object:
 def test_fresh_state_reports_zero_of_one_thousand():
     answer = abonent_limit()
     assert (answer["Kod"], answer["LimitWykorzystany"], answer["LimitPrzyznany"]) == (0, 0, 1000)
-    assert MONTHLY_LIMIT_GRANTED == 1000
 
 
 def test_documents_created_through_the_api_are_counted_for_the_month():
@@ -230,3 +229,14 @@ def test_a_snapshot_from_an_earlier_month_restores_to_zero(clock):
     clock[0] = local_epoch(4, 2)
     store.restore(snap)
     assert store.monthly_created() == 0
+
+
+def test_the_default_grant_follows_the_configured_monthly_limit(monkeypatch):
+    monkeypatch.setattr(settings, "monthly_limit", 2000)
+    assert abonent_limit()["LimitPrzyznany"] == 2000
+
+
+def test_raising_the_grant_mid_month_keeps_the_used_count():
+    api_create()
+    set_monthly({"granted": 2000})
+    assert (abonent_limit()["LimitWykorzystany"], abonent_limit()["LimitPrzyznany"]) == (1, 2000)

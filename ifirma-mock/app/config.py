@@ -15,6 +15,19 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+#: iFirma's monthly API limit (LimitPrzyznany) for the default plan.
+DEFAULT_MONTHLY_LIMIT = 1000
+
+
+def monthly_limit_from_env(raw: str | None) -> int:
+    """A whole number of at least 1 is the granted limit; anything else keeps the default."""
+    try:
+        value = int(raw.strip())
+    except (AttributeError, ValueError):
+        return DEFAULT_MONTHLY_LIMIT
+    return value if value >= 1 else DEFAULT_MONTHLY_LIMIT
+
+
 class Settings:
     """Mirrors the credentials the PrestaShop module is configured with."""
 
@@ -43,6 +56,9 @@ class Settings:
 
     #: Simulated rate limit: max authenticated calls per calendar day (0 = off).
     rate_limit_day: int = int(os.getenv("IFIRMA_MOCK_RATE_LIMIT_DAY", "0") or 0)
+
+    #: Monthly API limit abonent/limit.json grants the account (iFirma assigns it per account on request).
+    monthly_limit: int = monthly_limit_from_env(os.getenv("IFIRMA_MOCK_MONTHLY_LIMIT"))
 
     #: Enables the /__mock/* seeding endpoints (HTTP 404 when false).
     test_endpoints: bool = _env_bool("IFIRMA_MOCK_TEST_ENDPOINTS", True)

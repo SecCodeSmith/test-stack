@@ -947,8 +947,6 @@ def set_switch(name: str, value: Any) -> None:
 
 RATE_LIMIT_KEYS = {"per_minute": "limit_minute", "per_day": "limit_day"}
 
-#: iFirma's monthly API limit for the account (the default plan), as abonent/limit.json reports it.
-MONTHLY_LIMIT_GRANTED = 1000
 MONTHLY_LIMIT_MINIMUM = {"granted": 1, "used": 0}
 
 
@@ -957,7 +955,7 @@ def monthly_limit_data() -> dict[str, int]:
     overrides = store.monthly_overrides()
     return {
         "used": overrides.get("used", store.monthly_created()),
-        "granted": overrides.get("granted", MONTHLY_LIMIT_GRANTED),
+        "granted": overrides.get("granted", settings.monthly_limit),
     }
 
 

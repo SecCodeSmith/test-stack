@@ -35,6 +35,10 @@ def test_stack_started_with_defaults_limits_the_mock_to_ifirmas_15000_per_day():
     assert default_of("IFIRMA_MOCK_RATE_LIMIT_DAY") == "15000"
 
 
+def test_stack_started_with_defaults_grants_the_account_a_monthly_limit_of_1000_until_set_to_its_own():
+    assert default_of("IFIRMA_MOCK_MONTHLY_LIMIT") == "1000"
+
+
 def test_stack_started_with_defaults_accepts_the_abonent_key_so_the_limit_endpoint_answers():
     match = re.search(r"^\s*IFIRMA_MOCK_KEY_ABONENT:\s*\$\{IFIRMA_KEY_ABONENT:-([0-9a-f]+)\}\s*$", compose_text(), re.MULTILINE)
 
